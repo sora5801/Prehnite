@@ -34,3 +34,6 @@ Thumbs.db
 
 # Per-task agent subprocess logs from `prehnite batch`
 /batch-logs/
+
+# MCP server session descriptors (resumable session state)
+/sessions/

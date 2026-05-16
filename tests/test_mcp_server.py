@@ -156,3 +156,188 @@ async def test_describe_task_unknown_id_raises(fake_tasks_dir: Path) -> None:
     server = build_server()
     with pytest.raises(Exception):
         await server.call_tool("describe_task", {"task_id": "no-such-task"})
+
+
+# --- session persistence + rehydration ----------------------------------
+
+
+import json as _json
+from typing import Any
+
+from prehnite import mcp_server
+from prehnite.mcp_server import (
+    _count_agent_commands,
+    _delete_session_file,
+    _persist_session,
+    _rehydrate_sessions,
+    _session_file_path,
+)
+from prehnite.sandbox import SandboxError
+
+
+def _seed_session_file(tmp_path: Path, sid: str, **overrides: Any) -> Path:
+    """Write a session JSON descriptor by hand. Mirrors what _persist_session
+    would produce so tests can exercise the rehydrate path directly."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "session_id": sid,
+        "task": Task(id="demo", description="x").model_dump(mode="json"),
+        "container_id": "deadbeef",
+        "trajectory_path": str(tmp_path / "trajectories" / "demo" / f"{sid}.jsonl"),
+        "started_at_iso": "2026-05-16T00:00:00Z",
+        "network_mode": "none",
+    }
+    payload.update(overrides)
+    path = sdir / f"{sid}.json"
+    path.write_text(_json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_persist_session_writes_descriptor(tmp_path: Path) -> None:
+    """_persist_session writes a JSON file at sessions/<sid>.json with the
+    fields _rehydrate_sessions needs."""
+    out_path = tmp_path / "trajectories" / "demo" / "run.jsonl"
+    writer = TrajectoryWriter(out_path)
+    writer.open()
+    sess = _Session(
+        task=Task(id="demo", description="x"),
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        writer=writer,
+        trajectory_path=out_path,
+    )
+    _persist_session(tmp_path, "abc123", sess)
+
+    f = _session_file_path(tmp_path, "abc123")
+    assert f.is_file()
+    payload = _json.loads(f.read_text(encoding="utf-8"))
+    assert payload["session_id"] == "abc123"
+    assert payload["container_id"] == "fake-container"
+    assert payload["network_mode"] == "none"
+    assert payload["task"]["id"] == "demo"
+
+
+def test_delete_session_file_removes_and_is_idempotent(tmp_path: Path) -> None:
+    f = _seed_session_file(tmp_path, "abc")
+    assert f.exists()
+    _delete_session_file(tmp_path, "abc")
+    assert not f.exists()
+    # Second call must not raise — finish_task and abort_task both call it,
+    # and a manual cleanup or crash could mean the file's already gone.
+    _delete_session_file(tmp_path, "abc")
+
+
+def test_count_agent_commands_recovers_from_trajectory(tmp_path: Path) -> None:
+    traj = tmp_path / "demo.jsonl"
+    with TrajectoryWriter(traj) as w:
+        w.write("run_started", {})
+        w.write("agent_command", {"cmd": "echo 1", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+        w.write("agent_thought", {"thought": "thinking"})
+        w.write("agent_command", {"cmd": "echo 2", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+        w.write("agent_command", {"cmd": "echo 3", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+    assert _count_agent_commands(traj) == 3
+
+
+# Fakes for the Sandbox(...).attach() path used by _rehydrate_sessions.
+
+
+class _AttachOKSandbox:
+    """Stub Sandbox whose attach() succeeds without touching Docker."""
+
+    def __init__(self, task: Task, egress_callback: Any = None) -> None:
+        self.task = task
+        self.container_id: str | None = None
+
+    def attach(self, container_id: str) -> None:
+        self.container_id = container_id
+
+    def stop(self) -> None:
+        return None
+
+
+class _AttachFailSandbox:
+    """Stub Sandbox whose attach() always raises (container is gone)."""
+
+    def __init__(self, task: Task, egress_callback: Any = None) -> None:
+        self.task = task
+
+    def attach(self, container_id: str) -> None:
+        raise SandboxError(f"container {container_id} not found")
+
+
+def test_rehydrate_drops_restricted_mode_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Restricted-mode sessions can't resume — the proxy port is gone."""
+    f = _seed_session_file(tmp_path, "abc", network_mode="restricted")
+    out = _rehydrate_sessions(tmp_path)
+    assert out == {}
+    assert not f.exists()  # dropped
+    assert "restricted" in capsys.readouterr().err.lower()
+
+
+def test_rehydrate_drops_session_with_missing_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If the container died, the session can't resume; drop it cleanly."""
+    monkeypatch.setattr(mcp_server, "Sandbox", _AttachFailSandbox)
+    f = _seed_session_file(tmp_path, "abc")
+    # Create the trajectory file too so it's not the trajectory's absence
+    # that's tripping us up.
+    traj = tmp_path / "trajectories" / "demo" / "abc.jsonl"
+    traj.parent.mkdir(parents=True, exist_ok=True)
+    traj.touch()
+
+    out = _rehydrate_sessions(tmp_path)
+    assert out == {}
+    assert not f.exists()
+    assert "gone" in capsys.readouterr().err.lower()
+
+
+def test_rehydrate_rebuilds_session_when_container_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full happy path: container attach succeeds, writer reopens, counter
+    recovered from the existing trajectory."""
+    monkeypatch.setattr(mcp_server, "Sandbox", _AttachOKSandbox)
+    # Lay down an existing trajectory with 2 agent_command events so the
+    # counter recovery has something real to count.
+    traj = tmp_path / "trajectories" / "demo" / "run.jsonl"
+    with TrajectoryWriter(traj) as w:
+        w.write("run_started", {})
+        w.write("agent_command", {"cmd": "echo 1", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+        w.write("agent_command", {"cmd": "echo 2", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+    _seed_session_file(
+        tmp_path,
+        "live",
+        trajectory_path=str(traj),
+    )
+
+    out = _rehydrate_sessions(tmp_path)
+    assert "live" in out
+    sess = out["live"]
+    assert sess.sandbox.container_id == "deadbeef"  # attach received the id
+    assert sess.agent_command_count == 2  # recovered from trajectory
+    assert sess.trajectory_path == traj
+
+
+def test_rehydrate_returns_empty_when_dir_missing(tmp_path: Path) -> None:
+    """No sessions/ dir means no resumable sessions — return empty dict,
+    don't crash."""
+    assert _rehydrate_sessions(tmp_path) == {}
+
+
+def test_rehydrate_skips_malformed_session_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    bad = sdir / "broken.json"
+    bad.write_text("{ not json", encoding="utf-8")
+    out = _rehydrate_sessions(tmp_path)
+    assert out == {}
+    # Malformed file is deleted so it doesn't keep tripping us.
+    assert not bad.exists()
+    assert "malformed" in capsys.readouterr().err.lower()

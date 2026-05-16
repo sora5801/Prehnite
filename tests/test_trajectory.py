@@ -56,6 +56,34 @@ def test_writer_creates_parent_directory(tmp_path: Path) -> None:
     assert p.is_file()
 
 
+def test_reopen_existing_trajectory_continues_seq(tmp_path: Path) -> None:
+    """A second writer over an existing file must not restart seq at 0 —
+    new events continue from where the prior writer left off. This is the
+    invariant the MCP server's session resume relies on."""
+    p = tmp_path / "traj.jsonl"
+    with TrajectoryWriter(p) as w1:
+        w1.write("run_started", {})
+        w1.write("agent_command", {"cmd": "echo a"})
+        w1.write("agent_command", {"cmd": "echo b"})
+
+    # New writer over the same file (simulates MCP server restart).
+    with TrajectoryWriter(p) as w2:
+        ev = w2.write("agent_command", {"cmd": "echo c"})
+        assert ev.seq == 3  # 0,1,2 from prior + this is 3
+
+    events = read_trajectory(p)
+    assert [e.seq for e in events] == [0, 1, 2, 3]
+    assert events[-1].data["cmd"] == "echo c"
+
+
+def test_reopen_empty_file_starts_seq_at_zero(tmp_path: Path) -> None:
+    p = tmp_path / "traj.jsonl"
+    p.touch()  # empty file exists
+    with TrajectoryWriter(p) as w:
+        ev = w.write("run_started", {})
+    assert ev.seq == 0
+
+
 def test_each_line_is_valid_json(tmp_path: Path) -> None:
     p = tmp_path / "traj.jsonl"
     with TrajectoryWriter(p) as w:

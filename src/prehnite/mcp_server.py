@@ -10,15 +10,24 @@ The agent drives a task interactively:
     finish_task(session_id)        -> RunResult            (runs verify, tears down)
     abort_task(session_id)         -> None                 (tears down without verify)
 
-Session state lives in this process. Sessions are keyed by UUID so the agent
-can run multiple tasks in parallel if it wants to (it usually won't).
+Sessions survive an MCP server restart. Each `start_task` writes a small
+JSON descriptor at <root>/sessions/<session_id>.json that records the
+container id and trajectory path. On `build_server()` startup the
+descriptors are read back and the in-process sessions dict is rehydrated
+by re-attaching to the still-running detached containers. `restricted`
+network-mode sessions can't be resumed (the agent's container has
+HTTP_PROXY pointing at a port the previous process owned); those are
+dropped at rehydrate time.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +37,7 @@ from prehnite.runner import trajectory_path
 from prehnite.sandbox import Sandbox, SandboxError
 from prehnite.schemas import RunResult, RunStatus, Task
 from prehnite.tasks.loader import discover_tasks
-from prehnite.trajectory import TrajectoryWriter
+from prehnite.trajectory import TrajectoryWriter, read_trajectory
 
 
 @dataclass
@@ -49,14 +58,139 @@ def _tasks_dir() -> Path:
     return Path(env).resolve() if env else _root() / "tasks"
 
 
+def _sessions_dir(root: Path) -> Path:
+    return root / "sessions"
+
+
+def _session_file_path(root: Path, session_id: str) -> Path:
+    return _sessions_dir(root) / f"{session_id}.json"
+
+
+def _persist_session(root: Path, session_id: str, sess: "_Session") -> None:
+    """Write the session descriptor to disk so a future MCP server process
+    can resume this session after a restart. Called once on start_task."""
+    _sessions_dir(root).mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_id": session_id,
+        "task": sess.task.model_dump(mode="json"),
+        "container_id": sess.sandbox.container_id,
+        "trajectory_path": str(sess.trajectory_path),
+        "started_at_iso": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "network_mode": sess.task.network.mode,
+    }
+    path = _session_file_path(root, session_id)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _delete_session_file(root: Path, session_id: str) -> None:
+    """Remove the session descriptor on finish_task / abort_task. Best-effort;
+    errors are swallowed because the in-memory teardown already happened."""
+    try:
+        _session_file_path(root, session_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _rehydrate_sessions(root: Path) -> dict[str, "_Session"]:
+    """Scan <root>/sessions/ on startup. For each descriptor:
+    - skip + delete the file if it's restricted-mode (proxy port is lost);
+    - skip + delete the file if the container is gone;
+    - otherwise re-attach to the container, reopen the trajectory writer
+      (which recovers the seq counter), recover agent_command_count from
+      the trajectory, and add an entry to the resumed sessions dict.
+    """
+    out: dict[str, _Session] = {}
+    sdir = _sessions_dir(root)
+    if not sdir.is_dir():
+        return out
+
+    for f in sorted(sdir.glob("*.json")):
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"prehnite-mcp: skipping malformed session file {f}: {e}", file=sys.stderr)
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+
+        sid = str(payload.get("session_id", ""))
+        if not sid:
+            f.unlink(missing_ok=True)
+            continue
+
+        if payload.get("network_mode") == "restricted":
+            print(
+                f"prehnite-mcp: cannot resume restricted-mode session {sid} "
+                f"(proxy port from prior process is gone); dropping",
+                file=sys.stderr,
+            )
+            f.unlink(missing_ok=True)
+            continue
+
+        try:
+            task = Task.model_validate(payload["task"])
+        except Exception as e:
+            print(f"prehnite-mcp: session {sid} has bad task payload: {e}", file=sys.stderr)
+            f.unlink(missing_ok=True)
+            continue
+
+        traj_path = Path(payload["trajectory_path"])
+        sandbox = Sandbox(task)
+        try:
+            sandbox.attach(str(payload["container_id"]))
+        except SandboxError as e:
+            print(
+                f"prehnite-mcp: session {sid} container is gone ({e}); dropping",
+                file=sys.stderr,
+            )
+            f.unlink(missing_ok=True)
+            continue
+
+        writer = TrajectoryWriter(traj_path)
+        writer.open()  # recovers the seq counter from the existing file
+
+        out[sid] = _Session(
+            task=task,
+            sandbox=sandbox,
+            writer=writer,
+            trajectory_path=traj_path,
+            agent_command_count=_count_agent_commands(traj_path),
+        )
+        print(
+            f"prehnite-mcp: resumed session {sid} (task={task.id}, "
+            f"container={payload['container_id'][:12]})",
+            file=sys.stderr,
+        )
+
+    return out
+
+
+def _count_agent_commands(trajectory_path: Path) -> int:
+    """Recover agent_command_count by counting matching events in the
+    trajectory. The trajectory is the source of truth for what happened,
+    so we don't need to persist the counter separately."""
+    try:
+        events = read_trajectory(trajectory_path)
+    except Exception:
+        return 0
+    return sum(1 for e in events if e.type == "agent_command")
+
+
 def build_server(
     sessions: dict[str, _Session] | None = None,
 ) -> FastMCP:
-    """Construct a FastMCP server. `sessions` is exposed so tests can inject
-    fake sessions without going through start_task (which needs Docker)."""
+    """Construct a FastMCP server.
+
+    `sessions` is exposed so tests can inject fake sessions without going
+    through start_task (which needs Docker). In production it's `None`,
+    and the dict is rehydrated from `<root>/sessions/*.json` so an MCP
+    server restart picks up where the previous process left off.
+    """
     server = FastMCP("prehnite")
     if sessions is None:
-        sessions = {}
+        sessions = _rehydrate_sessions(_root())
 
     @server.tool()
     def list_tasks(
@@ -143,9 +277,13 @@ def build_server(
                 raise RuntimeError(reason)
 
         sid = uuid.uuid4().hex
-        sessions[sid] = _Session(
+        sess = _Session(
             task=task, sandbox=sandbox, writer=writer, trajectory_path=out_path,
         )
+        sessions[sid] = sess
+        # Persist after setup succeeds — a session file means "live session,
+        # safe to resume." If setup failed we wouldn't be here.
+        _persist_session(_root(), sid, sess)
         return {
             "session_id": sid,
             "container_id": sandbox.container_id,
@@ -204,6 +342,7 @@ def build_server(
         finally:
             sess.sandbox.stop()
             sess.writer.close()
+            _delete_session_file(_root(), session_id)
 
     @server.tool()
     def abort_task(session_id: str) -> dict[str, str]:
@@ -217,6 +356,7 @@ def build_server(
         )
         sess.sandbox.stop()
         sess.writer.close()
+        _delete_session_file(_root(), session_id)
         return {"session_id": session_id, "status": "aborted"}
 
     return server

@@ -46,9 +46,12 @@ class TrajectoryWriter:
         if self._fh is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Append mode: if a writer with this path was used before, we keep the
-        # earlier events. Sequence numbers count only what *this* writer added,
-        # which is fine because the file already has its own contiguous range.
+        # If we're reopening an existing trajectory (e.g. a session resume
+        # after the MCP server restarted), recover the seq counter from the
+        # last event's seq+1 so new events continue the numbering instead of
+        # restarting at 0 and stomping on the existing sequence.
+        if self.path.exists() and self.path.stat().st_size > 0:
+            self._seq = _recover_next_seq(self.path)
         self._fh = self.path.open("a", encoding="utf-8")
 
     def write(self, event_type: EventType, data: dict[str, object]) -> TrajectoryEvent:
@@ -86,3 +89,22 @@ def read_trajectory(path: Path) -> list[TrajectoryEvent]:
                 continue
             events.append(TrajectoryEvent.model_validate(json.loads(line)))
     return events
+
+
+def _recover_next_seq(path: Path) -> int:
+    """Walk the file and return last event's `seq` + 1. Used by the writer's
+    open() to support session-resume after an MCP server restart. Cheap:
+    parses only the last non-empty line as JSON, not the whole file."""
+    last_line = ""
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                last_line = stripped
+    if not last_line:
+        return 0
+    try:
+        obj = json.loads(last_line)
+        return int(obj.get("seq", -1)) + 1
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return 0

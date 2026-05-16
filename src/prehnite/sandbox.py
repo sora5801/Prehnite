@@ -137,6 +137,31 @@ class Sandbox:
 
         self._container = container
 
+    def attach(self, container_id: str) -> None:
+        """Re-bind this Sandbox to an already-running container by id.
+
+        Used to resume a session after the MCP server process restarted —
+        the docker container is detached + `sleep infinity`, so it survives
+        the host-side process death. We don't re-spin the egress proxy
+        here; `restricted` mode can't resume (the container's HTTP_PROXY
+        points at a port the now-defunct old proxy owned) and the caller
+        must check `task.network.mode` before deciding to attach at all.
+        """
+        if self._container is not None:
+            raise SandboxError("sandbox already attached / started")
+        try:
+            self._client = docker.from_env()
+        except DockerException as e:
+            raise SandboxError(f"could not reach Docker daemon: {e}") from e
+        try:
+            self._container = self._client.containers.get(container_id)
+        except NotFound as e:
+            raise SandboxError(
+                f"container {container_id} not found — cannot resume session"
+            ) from e
+        except APIError as e:
+            raise SandboxError(f"docker attach failed: {e.explanation or e}") from e
+
     def exec(
         self, cmd: str, *, timeout_seconds: float | None = None
     ) -> CommandResult:
