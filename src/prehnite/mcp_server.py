@@ -35,6 +35,7 @@ class _Session:
     sandbox: Sandbox
     writer: TrajectoryWriter
     trajectory_path: Path
+    agent_command_count: int = 0
 
 
 def _root() -> Path:
@@ -121,6 +122,7 @@ def build_server() -> FastMCP:
         sess = _require(sessions, session_id)
         result = sess.sandbox.exec(cmd)
         sess.writer.write("agent_command", result.model_dump())
+        sess.agent_command_count += 1
         return result.model_dump()
 
     @server.tool()
@@ -139,11 +141,12 @@ def build_server() -> FastMCP:
                     verify_failures.append(cmd)
 
             status = RunStatus.PASSED if not verify_failures else RunStatus.FAILED
-            reason = (
-                "all verify checks passed"
-                if status is RunStatus.PASSED
-                else f"verify failed: {verify_failures}"
-            )
+            if status is RunStatus.PASSED:
+                reason = "all verify checks passed"
+            elif sess.agent_command_count == 0:
+                reason = "no agent activity (verify ran on untouched workspace)"
+            else:
+                reason = f"verify failed: {verify_failures}"
             sess.writer.write(
                 "run_finished", {"result": status.value, "reason": reason}
             )

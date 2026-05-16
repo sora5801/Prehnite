@@ -27,7 +27,7 @@ from prehnite.schemas import (
 from prehnite.trajectory import TrajectoryWriter
 
 
-@dataclass(frozen=True)
+@dataclass
 class RunContext:
     """Surface a running task exposes to its agent.
 
@@ -39,9 +39,12 @@ class RunContext:
     task: Task
     _sandbox: Sandbox
     _writer: TrajectoryWriter
+    _command_count: int = 0
 
     def exec(self, cmd: str) -> CommandResult:
-        return _exec_and_record(self._sandbox, self._writer, "agent_command", cmd)
+        result = _exec_and_record(self._sandbox, self._writer, "agent_command", cmd)
+        self._command_count += 1
+        return result
 
 
 AgentFn = Callable[[RunContext], None]
@@ -127,12 +130,15 @@ def run(
                 )
 
         # Agent phase.
+        agent_command_count = 0
         if agent is not None:
             ctx = RunContext(task=task, _sandbox=sandbox, _writer=writer)
             agent(ctx)
+            agent_command_count = ctx._command_count
         elif agent_commands is not None:
             for cmd in agent_commands:
                 _exec_and_record(sandbox, writer, "agent_command", cmd)
+                agent_command_count += 1
 
         # Verify: every command must exit 0 for the task to pass.
         verify_failures: list[str] = []
@@ -142,11 +148,12 @@ def run(
                 verify_failures.append(cmd)
 
         status = RunStatus.PASSED if not verify_failures else RunStatus.FAILED
-        reason = (
-            "all verify checks passed"
-            if status is RunStatus.PASSED
-            else f"verify failed: {verify_failures}"
-        )
+        if status is RunStatus.PASSED:
+            reason = "all verify checks passed"
+        elif agent_command_count == 0:
+            reason = "no agent activity (verify ran on untouched workspace)"
+        else:
+            reason = f"verify failed: {verify_failures}"
         writer.write("run_finished", {"result": status.value, "reason": reason})
         return RunResult(
             task_id=task.id,
