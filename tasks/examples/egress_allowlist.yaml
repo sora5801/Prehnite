@@ -1,0 +1,36 @@
+id: egress_allowlist
+description: |
+  Demonstrates the restricted-mode egress proxy on both the allowed and
+  denied paths. The sandbox is running with `network.mode: restricted`
+  and the default allowlist — which includes `example.com` but NOT
+  `www.iana.org`.
+
+  Probe both hosts with curl and write the results:
+
+  1. /workspace/ok_status — the HTTP status code returned by
+     `curl -sS https://example.com`. Should be `200`: the proxy allowed
+     the CONNECT and example.com responded normally.
+
+  2. /workspace/blocked_exitcode — curl's exit code after attempting
+     `curl -sS https://www.iana.org`. Should be non-zero: the proxy
+     refused the CONNECT before any DNS or TLS, and curl reports
+     something like "Received HTTP code 403 from proxy after CONNECT".
+
+  After the run, the trajectory contains two `egress_attempt` events —
+  one `allowed=true`, one `allowed=false` — proving the policy enforced
+  end-to-end. The agent never gets to see the proxy's denial response
+  beyond curl's error message; the audit lives in the trajectory.
+image: prehnite-base:latest
+network:
+  mode: restricted
+timeout_seconds: 120
+workdir: /workspace
+tags: [network, egress, security]
+difficulty: easy
+setup:
+  - rm -rf /workspace/*
+verify:
+  - test -f /workspace/ok_status
+  - test "$(cat /workspace/ok_status)" = "200"
+  - test -f /workspace/blocked_exitcode
+  - test "$(cat /workspace/blocked_exitcode)" != "0"
