@@ -16,6 +16,8 @@ image: prehnite-base:latest
 network: true
 timeout_seconds: 180
 workdir: /workspace
+tags: [network, package-management]
+difficulty: easy
 setup:
   - rm -rf /workspace/*
   - python3 -m venv /workspace/venv

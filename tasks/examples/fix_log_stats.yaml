@@ -12,6 +12,8 @@ description: |
 network: false
 timeout_seconds: 120
 workdir: /workspace
+tags: [bug-fix, python, regex]
+difficulty: medium
 setup:
   - rm -rf /workspace/*
   - |

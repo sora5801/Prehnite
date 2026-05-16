@@ -8,6 +8,8 @@ image: prehnite-base:latest
 network: false
 timeout_seconds: 120
 workdir: /workspace
+tags: [bug-fix, python]
+difficulty: easy
 setup:
   - rm -rf /workspace/*
   - |

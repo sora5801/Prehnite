@@ -6,6 +6,8 @@ image: prehnite-base:latest
 network: false
 timeout_seconds: 30
 workdir: /workspace
+tags: [smoke]
+difficulty: trivial
 setup:
   - rm -f /workspace/hello.txt
 verify:

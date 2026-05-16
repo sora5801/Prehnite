@@ -21,6 +21,8 @@ image: prehnite-base:latest
 network: false
 timeout_seconds: 60
 workdir: /workspace
+tags: [bug-fix, python, multi-file]
+difficulty: easy
 setup:
   - rm -rf /workspace/*
   - |

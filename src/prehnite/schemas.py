@@ -35,6 +35,8 @@ class Task(BaseModel):
     workdir: str = "/workspace"
     setup: list[str] = Field(default_factory=list)
     verify: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    difficulty: str | None = None
 
 
 class RunStatus(str, Enum):

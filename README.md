@@ -42,7 +42,10 @@ ls trajectories/
 
 Prehnite exposes a stdio MCP server. The server publishes these tools:
 
-- `list_tasks()` — returns task IDs + descriptions discovered under `tasks/`
+- `list_tasks(tag?, difficulty?)` — returns matching tasks. Both filters
+  optional and AND-combined.
+- `describe_task(task_id)` — returns the full task spec for a single task
+  (everything in the YAML).
 - `start_task(task_id)` — opens a sandbox, runs setup, returns a `session_id`
 - `exec(session_id, cmd)` — runs a shell command inside the sandbox
 - `note(session_id, thought)` — records the agent's reasoning between commands
@@ -73,6 +76,9 @@ verify:
   - test -f /workspace/hello.txt
   - grep -q hi /workspace/hello.txt
 ```
+
+Optional `tags: [str]` and `difficulty: str` fields enable filtering via
+`list_tasks(tag, difficulty)`.
 
 ## Trajectory format
 

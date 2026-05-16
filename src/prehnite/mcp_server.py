@@ -2,7 +2,8 @@
 
 The agent drives a task interactively:
 
-    list_tasks()                   -> [{id, description}, ...]
+    list_tasks(tag?, difficulty?)  -> [{id, description, tags, difficulty}, ...]
+    describe_task(task_id)         -> full Task spec as a dict
     start_task(task_id)            -> {session_id, container_id, trajectory_path}
     exec(session_id, cmd)          -> CommandResult
     note(session_id, thought)      -> None                 (records reasoning)
@@ -58,12 +59,38 @@ def build_server(
         sessions = {}
 
     @server.tool()
-    def list_tasks() -> list[dict[str, str]]:
-        """Return every task discoverable under the configured tasks directory."""
-        return [
-            {"id": t.id, "description": t.description}
-            for t in discover_tasks(_tasks_dir())
-        ]
+    def list_tasks(
+        tag: str | None = None,
+        difficulty: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List tasks under the configured tasks directory.
+
+        Optional filters: pass `tag` to keep only tasks whose `tags` list
+        contains it; pass `difficulty` to keep only tasks whose `difficulty`
+        equals it. Both are AND-combined.
+        """
+        out: list[dict[str, Any]] = []
+        for t in discover_tasks(_tasks_dir()):
+            if tag is not None and tag not in t.tags:
+                continue
+            if difficulty is not None and t.difficulty != difficulty:
+                continue
+            out.append(
+                {
+                    "id": t.id,
+                    "description": t.description,
+                    "tags": list(t.tags),
+                    "difficulty": t.difficulty,
+                }
+            )
+        return out
+
+    @server.tool()
+    def describe_task(task_id: str) -> dict[str, Any]:
+        """Return the full task spec for `task_id` (everything in the YAML
+        file). Useful when an agent wants the verify steps, setup commands,
+        or other context that `list_tasks` doesn't include."""
+        return _find_task(task_id).model_dump(mode="json")
 
     @server.tool()
     def start_task(task_id: str) -> dict[str, Any]:

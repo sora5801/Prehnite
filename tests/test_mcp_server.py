@@ -73,3 +73,86 @@ async def test_note_unknown_session_raises() -> None:
         await server.call_tool(
             "note", {"session_id": "nope", "thought": "hi"}
         )
+
+
+# --- list_tasks filtering + describe_task --------------------------------
+
+
+def _write_task(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+@pytest.fixture
+def fake_tasks_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A tasks dir on disk with three deliberately-varied tasks."""
+    tdir = tmp_path / "tasks"
+    _write_task(
+        tdir / "alpha.yaml",
+        "id: alpha\ndescription: a\ntags: [smoke]\ndifficulty: trivial\n",
+    )
+    _write_task(
+        tdir / "beta.yaml",
+        "id: beta\ndescription: b\ntags: [bug-fix, python]\ndifficulty: easy\n",
+    )
+    _write_task(
+        tdir / "gamma.yaml",
+        "id: gamma\ndescription: g\ntags: [bug-fix, regex]\ndifficulty: medium\n",
+    )
+    monkeypatch.setenv("PREHNITE_TASKS_DIR", str(tdir))
+    return tdir
+
+
+def _ids(rows: list[dict[str, object]]) -> set[str]:
+    return {str(r["id"]) for r in rows}
+
+
+async def test_list_tasks_no_filter_returns_all(fake_tasks_dir: Path) -> None:
+    server = build_server()
+    _, raw = await server.call_tool("list_tasks", {})
+    assert _ids(raw["result"]) == {"alpha", "beta", "gamma"}
+
+
+async def test_list_tasks_filters_by_tag(fake_tasks_dir: Path) -> None:
+    server = build_server()
+    _, raw = await server.call_tool("list_tasks", {"tag": "bug-fix"})
+    assert _ids(raw["result"]) == {"beta", "gamma"}
+
+
+async def test_list_tasks_filters_by_difficulty(fake_tasks_dir: Path) -> None:
+    server = build_server()
+    _, raw = await server.call_tool("list_tasks", {"difficulty": "medium"})
+    assert _ids(raw["result"]) == {"gamma"}
+
+
+async def test_list_tasks_filters_combine_with_and(
+    fake_tasks_dir: Path,
+) -> None:
+    server = build_server()
+    _, raw = await server.call_tool(
+        "list_tasks", {"tag": "bug-fix", "difficulty": "easy"}
+    )
+    assert _ids(raw["result"]) == {"beta"}
+
+
+async def test_describe_task_returns_full_spec(fake_tasks_dir: Path) -> None:
+    server = build_server()
+    # FastMCP passes dict returns through unwrapped (vs. wrapping list/scalar
+    # returns under "result"), so the spec is the raw response itself.
+    _, spec = await server.call_tool(
+        "describe_task", {"task_id": "beta"}
+    )
+    assert spec["id"] == "beta"
+    assert spec["tags"] == ["bug-fix", "python"]
+    assert spec["difficulty"] == "easy"
+    # Defaults that come from the model, not the YAML, must round-trip too.
+    assert spec["network"] is False
+    assert spec["workdir"] == "/workspace"
+
+
+async def test_describe_task_unknown_id_raises(fake_tasks_dir: Path) -> None:
+    server = build_server()
+    with pytest.raises(Exception):
+        await server.call_tool("describe_task", {"task_id": "no-such-task"})
