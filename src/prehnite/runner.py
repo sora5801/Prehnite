@@ -55,6 +55,16 @@ def trajectories_dir(root: Path) -> Path:
     return root / "trajectories"
 
 
+def overflow_dir(root: Path) -> Path:
+    """Where bounded-stream overflow files live (content-addressed by sha256).
+
+    The trajectory writer spills full stdout/stderr here whenever a command
+    event exceeds the per-stream cap; the trajectory keeps only the head
+    plus a pointer.
+    """
+    return root / "overflow"
+
+
 def trajectory_path(task: Task, root: Path) -> Path:
     """`<root>/trajectories/<task_id>/<utc-timestamp>.jsonl`."""
     stamp = utcnow_iso().replace(":", "").replace("-", "")
@@ -78,7 +88,7 @@ def run(
         raise ValueError("pass agent OR agent_commands, not both")
 
     out_path = trajectory_path(task, root)
-    writer = TrajectoryWriter(out_path)
+    writer = TrajectoryWriter(out_path, overflow_dir=overflow_dir(root))
     writer.open()
 
     def _record_egress(data: dict[str, object]) -> None:

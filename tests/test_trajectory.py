@@ -91,3 +91,69 @@ def test_each_line_is_valid_json(tmp_path: Path) -> None:
             w.write("agent_command", {"cmd": f"echo {i}", "exit_code": 0})
     for line in p.read_text(encoding="utf-8").splitlines():
         json.loads(line)
+
+
+def test_writer_caps_command_event_streams_when_overflow_dir_set(
+    tmp_path: Path,
+) -> None:
+    """A command event whose stdout overflows the cap gets head-truncated
+    and the full original is spilled to <overflow_dir>/<sha256>."""
+    p = tmp_path / "traj.jsonl"
+    odir = tmp_path / "overflow"
+    big = "x" * 20_000
+    with TrajectoryWriter(p, overflow_dir=odir, max_stream_bytes=1024) as w:
+        ev = w.write(
+            "agent_command",
+            {
+                "cmd": "noisy",
+                "exit_code": 0,
+                "stdout": big,
+                "stderr": "",
+                "duration_ms": 1,
+            },
+        )
+    # The event's data was truncated in-place — that's what gets persisted
+    # AND what the MCP exec callsite returns to the agent.
+    assert len(str(ev.data["stdout"]).encode("utf-8")) <= 1024
+    assert ev.data["stdout_truncated"] is True
+    assert ev.data["stdout_original_bytes"] == 20_000
+
+    sha = ev.data["stdout_overflow_sha256"]
+    assert (odir / str(sha)).read_bytes() == big.encode("utf-8")
+
+    # The JSONL on disk also has the truncated form (not the original).
+    parsed = json.loads(p.read_text(encoding="utf-8").splitlines()[0])
+    assert len(parsed["data"]["stdout"].encode("utf-8")) <= 1024
+
+
+def test_writer_leaves_non_command_events_untouched(tmp_path: Path) -> None:
+    """A `note`/`agent_thought` event with huge text is NOT capped — the
+    cap only applies to command stdout/stderr."""
+    p = tmp_path / "traj.jsonl"
+    odir = tmp_path / "overflow"
+    big = "x" * 20_000
+    with TrajectoryWriter(p, overflow_dir=odir, max_stream_bytes=1024) as w:
+        ev = w.write("agent_thought", {"thought": big})
+    assert ev.data["thought"] == big
+    # No overflow file was written for the thought.
+    assert not odir.exists() or list(odir.iterdir()) == []
+
+
+def test_writer_with_no_overflow_dir_preserves_full_output(tmp_path: Path) -> None:
+    """Default construction (no overflow_dir) keeps all bytes — used by
+    tests and callers that explicitly want raw payloads."""
+    p = tmp_path / "traj.jsonl"
+    big = "x" * 20_000
+    with TrajectoryWriter(p) as w:
+        ev = w.write(
+            "agent_command",
+            {
+                "cmd": "noisy",
+                "exit_code": 0,
+                "stdout": big,
+                "stderr": "",
+                "duration_ms": 1,
+            },
+        )
+    assert ev.data["stdout"] == big
+    assert "stdout_truncated" not in ev.data

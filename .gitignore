@@ -37,3 +37,8 @@ Thumbs.db
 
 # MCP server session descriptors (resumable session state)
 /sessions/
+
+# Content-addressed overflow for capped trajectory streams (stdout/stderr
+# that exceeded the per-event byte budget). Reviewable on disk but not
+# committed.
+/overflow/

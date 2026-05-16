@@ -768,3 +768,74 @@ def test_rehydrate_skips_malformed_session_file(
     # Malformed file is deleted so it doesn't keep tripping us.
     assert not bad.exists()
     assert "malformed" in capsys.readouterr().err.lower()
+
+
+# --- output truncation in exec ------------------------------------------
+
+
+class _NoisySandbox:
+    """Sandbox stub that returns whatever (cmd, stdout, stderr) the test wants."""
+
+    def __init__(self, stdout: str = "", stderr: str = "") -> None:
+        self.container_id = "fake-container"
+        self._stdout = stdout
+        self._stderr = stderr
+
+    def exec(self, cmd: str) -> Any:
+        from prehnite.schemas import CommandResult
+
+        return CommandResult(
+            cmd=cmd,
+            exit_code=0,
+            stdout=self._stdout,
+            stderr=self._stderr,
+            duration_ms=1,
+        )
+
+    def stop(self) -> None:
+        return None
+
+
+async def test_exec_returns_truncated_stdout_and_spills_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the agent's command emits more stdout than the per-stream
+    cap, the dict returned to the agent has only the truncated head,
+    the trajectory line on disk matches, and the full bytes land in
+    <root>/overflow/<sha256>."""
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+
+    out_path = tmp_path / "traj.jsonl"
+    # Tight cap to force overflow on a small payload.
+    writer = TrajectoryWriter(
+        out_path, overflow_dir=tmp_path / "overflow", max_stream_bytes=64
+    )
+    writer.open()
+    big = "A" * 5_000
+    sess = _Session(
+        task=Task(id="t", description="x"),
+        sandbox=_NoisySandbox(stdout=big),  # type: ignore[arg-type]
+        writer=writer,
+        trajectory_path=out_path,
+    )
+    sid = "noisy-session"
+    sessions[sid] = sess
+
+    _, raw = await server.call_tool(
+        "exec", {"session_id": sid, "cmd": "spew"}
+    )
+    writer.close()
+
+    # Return value to the agent: head only + metadata pointer.
+    assert len(raw["stdout"].encode("utf-8")) <= 64
+    assert raw["stdout_truncated"] is True
+    assert raw["stdout_original_bytes"] == 5_000
+
+    # Overflow file holds the full original output, content-addressed.
+    sha = raw["stdout_overflow_sha256"]
+    assert (tmp_path / "overflow" / sha).read_bytes() == big.encode("utf-8")
+
+    # And one agent_command was counted (truncation is invisible to that path).
+    assert sess.agent_command_count == 1

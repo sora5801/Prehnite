@@ -38,7 +38,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from prehnite.runner import trajectory_path
+from prehnite.runner import overflow_dir, trajectory_path
 from prehnite.sandbox import Sandbox, SandboxError
 from prehnite.schemas import RunResult, RunStatus, Task, TrajectoryEvent
 from prehnite.tasks.loader import discover_tasks
@@ -154,7 +154,7 @@ def _rehydrate_sessions(root: Path) -> dict[str, "_Session"]:
             f.unlink(missing_ok=True)
             continue
 
-        writer = TrajectoryWriter(traj_path)
+        writer = TrajectoryWriter(traj_path, overflow_dir=overflow_dir(root))
         writer.open()  # recovers the seq counter from the existing file
 
         out[sid] = _Session(
@@ -302,7 +302,7 @@ def build_server(
         """
         task = _find_task(task_id)
         out_path = trajectory_path(task, _root())
-        writer = TrajectoryWriter(out_path)
+        writer = TrajectoryWriter(out_path, overflow_dir=overflow_dir(_root()))
         writer.open()
 
         def _record_egress(data: dict[str, object]) -> None:
@@ -359,12 +359,21 @@ def build_server(
 
     @server.tool()
     def exec(session_id: str, cmd: str) -> dict[str, Any]:
-        """Run a single shell command inside the session's sandbox."""
+        """Run a single shell command inside the session's sandbox.
+
+        Large `stdout`/`stderr` is capped (default 8 KiB per stream).
+        Truncated streams are marked with `<field>_truncated: true` and
+        the full output is spilled to `<root>/overflow/<sha256>` —
+        accessible to a human reviewer with `cat`, and stable across
+        sessions thanks to content-addressing.
+        """
         sess = _require(sessions, session_id)
         result = sess.sandbox.exec(cmd)
-        sess.writer.write("agent_command", result.model_dump())
+        event = sess.writer.write("agent_command", result.model_dump())
         sess.agent_command_count += 1
-        return result.model_dump()
+        # Return the post-truncation data so the agent's response is
+        # bounded — matching what they'd read back via read_trajectory.
+        return dict(event.data)
 
     @server.tool()
     def note(session_id: str, thought: str) -> None:

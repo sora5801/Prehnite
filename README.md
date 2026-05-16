@@ -152,6 +152,16 @@ triggered them. That ordering is temporally correct — the network call
 happens *inside* the exec — and `TrajectoryWriter` is `Lock`-guarded so the
 proxy thread and main thread can't race or produce torn lines.
 
+**Output truncation:** `stdout` and `stderr` on `setup_command`,
+`agent_command`, and `verify_command` events are capped at 8 KiB per stream.
+When a stream overflows, the trajectory keeps only the head plus
+`stdout_truncated: true`, `stdout_overflow_sha256: "<hex>"`, and
+`stdout_original_bytes: <int>` (mirror fields for `stderr`). The full
+original is written to `<root>/overflow/<sha256>` — content-addressed, so
+identical outputs across commands dedupe, and any reviewer can recover the
+full bytes with `cat overflow/<sha>`. The MCP `exec` tool returns the same
+truncated form, bounding what reaches the agent's context.
+
 ## Project layout
 
 See [CLAUDE.md](CLAUDE.md). The interesting modules are under `src/prehnite/`.

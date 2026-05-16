@@ -16,19 +16,40 @@ from pathlib import Path
 from types import TracebackType
 from typing import IO, Self
 
+from prehnite.overflow import DEFAULT_MAX_BYTES, cap_command_data
 from prehnite.schemas import EventType, TrajectoryEvent, utcnow_iso
+
+# Event types whose `data` dicts carry command output worth bounding.
+# `stdout`/`stderr` on these can come straight from a build tool or a
+# `cat large_file`; truncating here is what keeps trajectories small and
+# the agent's context window healthy when it calls `read_trajectory`.
+_CAPPED_EVENT_TYPES: frozenset[str] = frozenset(
+    {"setup_command", "agent_command", "verify_command"}
+)
 
 
 class TrajectoryWriter:
     """Sequenced, append-only writer for a single trajectory file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        overflow_dir: Path | None = None,
+        max_stream_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> None:
         self.path = path
         self._fh: IO[str] | None = None
         self._seq = 0
         self._closed = False
         # Egress proxy writes from a background thread; serialize seq + write.
         self._lock = threading.Lock()
+        # If overflow_dir is set, command-event stdout/stderr get capped
+        # at `max_stream_bytes` and the original is spilled there via
+        # prehnite.overflow.cap_command_data. None disables truncation
+        # entirely — handy for tests that want raw output.
+        self._overflow_dir = overflow_dir
+        self._max_stream_bytes = max_stream_bytes
 
     def __enter__(self) -> Self:
         self.open()
@@ -60,6 +81,16 @@ class TrajectoryWriter:
                 raise RuntimeError("trajectory writer is closed")
             if self._fh is None:
                 raise RuntimeError("trajectory writer is not open")
+
+            if (
+                self._overflow_dir is not None
+                and event_type in _CAPPED_EVENT_TYPES
+            ):
+                data = cap_command_data(
+                    data,
+                    max_bytes=self._max_stream_bytes,
+                    overflow_dir=self._overflow_dir,
+                )
 
             event = TrajectoryEvent(
                 seq=self._seq,
