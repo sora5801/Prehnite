@@ -1,0 +1,51 @@
+id: merge_configs
+description: |
+  /workspace/ contains three files:
+    - defaults.json  — base configuration
+    - overrides.json — per-environment overrides
+    - merge.py       — reads both, merges them, prints the result
+
+  merge.py is supposed to deep-merge: when both values at the same key are
+  dicts, merge them recursively; otherwise the value from overrides wins.
+  Currently it does a shallow merge with `{**a, **b}`, which clobbers nested
+  defaults entirely.
+
+  Fix merge.py so that `python3 merge.py` (run from /workspace) prints
+  exactly:
+
+    {"cache": {"ttl": 60}, "db": {"host": "prod.example.com", "port": 5432, "ssl": true}}
+
+  (`json.dumps(..., sort_keys=True)` produces this layout — keys are
+  sorted alphabetically at every level.)
+image: prehnite-base:latest
+network: false
+timeout_seconds: 60
+workdir: /workspace
+setup:
+  - rm -rf /workspace/*
+  - |
+    cat > /workspace/defaults.json <<'JSON'
+    {"db": {"host": "localhost", "port": 5432}, "cache": {"ttl": 60}}
+    JSON
+  - |
+    cat > /workspace/overrides.json <<'JSON'
+    {"db": {"host": "prod.example.com", "ssl": true}}
+    JSON
+  - |
+    cat > /workspace/merge.py <<'PY'
+    import json
+
+    with open("defaults.json") as f:
+        defaults = json.load(f)
+    with open("overrides.json") as f:
+        overrides = json.load(f)
+
+    # BUG: shallow merge — overrides.db replaces defaults.db wholesale,
+    # so defaults.db.port (5432) is lost.
+    merged = {**defaults, **overrides}
+
+    print(json.dumps(merged, sort_keys=True))
+    PY
+verify:
+  - |
+    cd /workspace && test "$(python3 merge.py)" = '{"cache": {"ttl": 60}, "db": {"host": "prod.example.com", "port": 5432, "ssl": true}}'

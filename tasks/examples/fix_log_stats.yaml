@@ -1,0 +1,56 @@
+id: fix_log_stats
+description: |
+  /workspace/stats.py reads /workspace/access.log and is supposed to print
+  the count of unique client IPs that produced at least one HTTP 5xx
+  response. For the included log the correct answer is 3.
+
+  Run it. The script is broken in more than one way — fixing the most
+  obvious bug isn't enough to get the right answer. Iterate until
+  `python3 stats.py` prints exactly:
+
+    3
+network: false
+timeout_seconds: 120
+workdir: /workspace
+setup:
+  - rm -rf /workspace/*
+  - |
+    cat > /workspace/access.log <<'LOG'
+    192.168.1.1 GET / 200
+    192.168.1.2 POST /api 503
+    192.168.1.1 GET /home 200
+    10.0.0.5 GET /admin 500
+    192.168.1.2 GET / 200
+    10.0.0.5 POST /api 503
+    192.168.1.2 GET /api 502
+    10.0.0.5 GET /home 200
+    172.16.0.1 GET /admin 200
+    192.168.1.10 GET /home 503
+    192.168.1.1 GET / 200
+    LOG
+  - |
+    cat > /workspace/stats.py <<'PY'
+    import re
+
+    # BUG #1 (subtle): last octet uses \d not \d+, so any IP whose last
+    # component is more than one digit (e.g. 192.168.1.10) silently fails
+    # to match and is dropped from the count.
+    pattern = re.compile(r"^(\d+\.\d+\.\d+\.\d) \S+ \S+ (\d{3})$")
+
+    fivexx_ips = set()
+    with open("access.log") as f:
+        for line in f:
+            m = pattern.match(line.strip())
+            if not m:
+                continue
+            ip, status = m.groups()
+            if status[0] == "5":
+                fivexx_ips.add(ip)
+
+    # BUG #2 (looks intentional, isn't): the -1 was added during a
+    # half-finished refactor and never removed. Drops the count below the
+    # true value even when bug #1 is fixed.
+    print(len(fivexx_ips) - 1)
+    PY
+verify:
+  - cd /workspace && test "$(python3 stats.py)" = "3"

@@ -1,0 +1,30 @@
+id: install_cowsay
+description: |
+  /workspace/app.py imports the third-party `cowsay` package and prints
+  a cow saying "hello prehnite". A virtualenv has already been created at
+  /workspace/venv during setup, but `cowsay` is not installed in it.
+
+  Install cowsay into the venv (use `/workspace/venv/bin/pip install cowsay`)
+  so that running `/workspace/venv/bin/python /workspace/app.py` succeeds
+  and the output contains the message.
+
+  This task requires network access — the task spec sets `network: true`,
+  which switches the sandbox from the default `--network none` to a
+  bridged network so pip can reach PyPI. If you see a connection error,
+  the network opt-in didn't take effect.
+image: prehnite-base:latest
+network: true
+timeout_seconds: 180
+workdir: /workspace
+setup:
+  - rm -rf /workspace/*
+  - python3 -m venv /workspace/venv
+  - |
+    cat > /workspace/app.py <<'PY'
+    import cowsay
+    cowsay.cow("hello prehnite")
+    PY
+verify:
+  # If cowsay isn't installed, app.py raises ImportError and prints nothing
+  # to stdout, so grep -q returns 1 and the verify fails.
+  - /workspace/venv/bin/python /workspace/app.py | grep -q "hello prehnite"
