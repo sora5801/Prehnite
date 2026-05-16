@@ -694,6 +694,7 @@ _MCP_TOOL_NAMES: tuple[str, ...] = (
     "start_task",
     "exec",
     "note",
+    "read_trajectory",
     "finish_task",
     "abort_task",
 )

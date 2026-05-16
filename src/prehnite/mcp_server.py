@@ -7,6 +7,8 @@ The agent drives a task interactively:
     start_task(task_id)            -> {session_id, container_id, trajectory_path}
     exec(session_id, cmd)          -> CommandResult
     note(session_id, thought)      -> None                 (records reasoning)
+    read_trajectory(session_id,    -> list[event]          (reflect on own run so far)
+                    since_seq?)
     finish_task(session_id)        -> RunResult            (runs verify, tears down)
     abort_task(session_id)         -> None                 (tears down without verify)
 
@@ -37,7 +39,8 @@ from prehnite.runner import trajectory_path
 from prehnite.sandbox import Sandbox, SandboxError
 from prehnite.schemas import RunResult, RunStatus, Task
 from prehnite.tasks.loader import discover_tasks
-from prehnite.trajectory import TrajectoryWriter, read_trajectory
+from prehnite.trajectory import TrajectoryWriter
+from prehnite.trajectory import read_trajectory as _read_trajectory_file
 
 
 @dataclass
@@ -172,7 +175,7 @@ def _count_agent_commands(trajectory_path: Path) -> int:
     trajectory. The trajectory is the source of truth for what happened,
     so we don't need to persist the counter separately."""
     try:
-        events = read_trajectory(trajectory_path)
+        events = _read_trajectory_file(trajectory_path)
     except Exception:
         return 0
     return sum(1 for e in events if e.type == "agent_command")
@@ -306,6 +309,29 @@ def build_server(
         record, the more useful the trajectory is."""
         sess = _require(sessions, session_id)
         sess.writer.write("agent_thought", {"thought": thought})
+
+    @server.tool()
+    def read_trajectory(
+        session_id: str, since_seq: int = 0
+    ) -> list[dict[str, Any]]:
+        """Read back your own trajectory so far — every event recorded in
+        this session, including setup commands, your own exec/note calls,
+        and any egress attempts. Useful when you need to recall what you
+        tried, what failed, what stdout you saw, or what you noted
+        earlier. Each event has `seq`, `ts`, `type`, and `data` keys.
+
+        Set `since_seq` to fetch only events with seq >= since_seq — e.g.,
+        if you last read up to seq=10, pass since_seq=11 to get just
+        what's happened since. Default 0 returns everything.
+
+        This is a read; it doesn't count as agent activity (the
+        agent_command_count that distinguishes "no activity" from
+        "verify failed" is untouched)."""
+        sess = _require(sessions, session_id)
+        events = _read_trajectory_file(sess.trajectory_path)
+        return [
+            e.model_dump(mode="json") for e in events if e.seq >= since_seq
+        ]
 
     @server.tool()
     def finish_task(session_id: str) -> dict[str, Any]:

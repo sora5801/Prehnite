@@ -75,6 +75,112 @@ async def test_note_unknown_session_raises() -> None:
         )
 
 
+# --- read_trajectory (in-session reflection) ----------------------------
+
+
+async def test_read_trajectory_returns_all_events_so_far(
+    tmp_path: Path,
+) -> None:
+    """An agent calling read_trajectory(session_id) sees every event
+    recorded in this session: setup, agent_command, agent_thought, all
+    of it. This is the read counterpart to note's write."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.write("setup_command", {
+        "cmd": "rm -rf /workspace/*", "exit_code": 0,
+        "stdout": "", "stderr": "", "duration_ms": 12,
+    })
+    writer.write("agent_command", {
+        "cmd": "cat data.txt", "exit_code": 0,
+        "stdout": "hello\n", "stderr": "", "duration_ms": 8,
+    })
+    writer.write("agent_thought", {"thought": "let me try replacing the file"})
+    writer.write("agent_command", {
+        "cmd": "echo new > data.txt", "exit_code": 0,
+        "stdout": "", "stderr": "", "duration_ms": 5,
+    })
+    writer.close()
+
+    _, raw = await server.call_tool("read_trajectory", {"session_id": sid})
+    events = raw["result"]
+
+    assert [e["type"] for e in events] == [
+        "setup_command", "agent_command", "agent_thought", "agent_command",
+    ]
+    # The agent's earlier stdout — exactly the thing it'd want to recall.
+    assert events[1]["data"]["stdout"] == "hello\n"
+    # The agent's own note — the "memory" piece.
+    assert events[2]["data"]["thought"] == "let me try replacing the file"
+
+
+async def test_read_trajectory_since_seq_filters_old_events(
+    tmp_path: Path,
+) -> None:
+    """An agent that already saw events up to seq=N can pass
+    since_seq=N+1 to fetch only what's new."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    for i in range(5):
+        writer.write("agent_command", {
+            "cmd": f"echo {i}", "exit_code": 0,
+            "stdout": f"{i}\n", "stderr": "", "duration_ms": 1,
+        })
+    writer.close()
+
+    _, raw = await server.call_tool(
+        "read_trajectory", {"session_id": sid, "since_seq": 3}
+    )
+    events = raw["result"]
+
+    # Only seq 3 and 4 should come back.
+    assert [e["seq"] for e in events] == [3, 4]
+
+
+async def test_read_trajectory_does_not_count_as_agent_activity(
+    tmp_path: Path,
+) -> None:
+    """Reading is not acting — agent_command_count must stay where it was.
+    A session with only read_trajectory calls would still hit the
+    'no agent activity' verdict on verify failure (the carve-out from
+    devlog 0002 is keyed on commands, not reads)."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+
+    sid, sess, writer = _seed_session(sessions, tmp_path, agent_command_count=4)
+    writer.write("run_started", {"task_id": "x", "image": "i", "container_id": "c"})
+    writer.close()
+
+    await server.call_tool("read_trajectory", {"session_id": sid})
+
+    # Counter unchanged — read_trajectory didn't bump it.
+    assert sess.agent_command_count == 4
+
+
+async def test_read_trajectory_unknown_session_raises() -> None:
+    server = build_server()
+    with pytest.raises(Exception):
+        await server.call_tool("read_trajectory", {"session_id": "nope"})
+
+
+async def test_read_trajectory_empty_trajectory_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """A session with no events written yet (besides what _seed_session
+    set up) should return whatever it has — even if that's nothing."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()  # close without writing anything
+
+    _, raw = await server.call_tool("read_trajectory", {"session_id": sid})
+    assert raw["result"] == []
+
+
 # --- list_tasks filtering + describe_task --------------------------------
 
 

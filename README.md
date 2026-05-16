@@ -83,6 +83,9 @@ Prehnite exposes a stdio MCP server. The server publishes these tools:
 - `start_task(task_id)` — opens a sandbox, runs setup, returns a `session_id`
 - `exec(session_id, cmd)` — runs a shell command inside the sandbox
 - `note(session_id, thought)` — records the agent's reasoning between commands
+- `read_trajectory(session_id, since_seq?)` — hands the agent its own
+  in-flight events so far (setup, exec/note/egress) so it can re-read
+  past outputs and reasoning mid-session
 - `finish_task(session_id)` — runs verify, writes the final event, tears down
 - `abort_task(session_id)` — tears down without running verify
 
