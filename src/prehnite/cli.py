@@ -24,13 +24,16 @@ an entire eval suite end-to-end.
 from __future__ import annotations
 
 import argparse
+import json
+import statistics
 import subprocess
 import sys
 import textwrap
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
-from typing import get_args
+from typing import Any, get_args
 
 from prehnite.runner import run
 from prehnite.schemas import EventType, RunStatus, TrajectoryEvent
@@ -111,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
         "--task",
         metavar="TASK_ID",
         help="Filter to one task id (still shows the per-task row, just with one entry)",
+    )
+    stats_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the human-readable table",
     )
     stats_p.set_defaults(func=_cmd_stats)
 
@@ -307,7 +315,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
     files = sorted(root.rglob("*.jsonl"))
     if not files:
-        print(f"no .jsonl files found under {root}")
+        if args.json:
+            print(json.dumps(_empty_stats_payload(), indent=2))
+        else:
+            print(f"no .jsonl files found under {root}")
         return 0
 
     runs: list[_RunSummary] = []
@@ -323,17 +334,34 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         runs.append(summary)
 
     if not runs:
-        print("no trajectories matched.")
+        if args.json:
+            # Stable empty shape so downstream tools don't have to special-case.
+            print(json.dumps(_empty_stats_payload(), indent=2))
+        else:
+            print("no trajectories matched.")
         return 0
 
-    _print_stats(runs)
+    if args.json:
+        _print_stats_json(runs)
+    else:
+        _print_stats(runs)
     return 0
 
 
 class _RunSummary:
-    """Everything the stats output needs from one trajectory file."""
+    """Per-trajectory aggregate. One trajectory file collapses to this set
+    of numbers; the table + JSON formatters work from a list of them."""
 
-    __slots__ = ("path", "task_id", "outcome", "reason", "egress")
+    __slots__ = (
+        "path",
+        "task_id",
+        "outcome",
+        "reason",
+        "egress",
+        "agent_cmd_count",
+        "thought_count",
+        "duration_s",
+    )
 
     def __init__(
         self,
@@ -342,12 +370,28 @@ class _RunSummary:
         outcome: str,
         reason: str,
         egress: list[tuple[str, int, bool]],
+        agent_cmd_count: int,
+        thought_count: int,
+        duration_s: float | None,
     ) -> None:
         self.path = path
         self.task_id = task_id
         self.outcome = outcome  # passed | failed | error | incomplete
         self.reason = reason
         self.egress = egress
+        self.agent_cmd_count = agent_cmd_count
+        self.thought_count = thought_count
+        self.duration_s = duration_s
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    """Parse the trajectory's ISO-8601 timestamps (with trailing 'Z') across
+    Python versions where fromisoformat may or may not accept 'Z'."""
+    try:
+        s = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        return datetime.fromisoformat(s)
+    except (ValueError, IndexError):
+        return None
 
 
 def _summarize(path: Path, events: list[TrajectoryEvent]) -> _RunSummary:
@@ -355,12 +399,21 @@ def _summarize(path: Path, events: list[TrajectoryEvent]) -> _RunSummary:
     outcome = "incomplete"
     reason = ""
     egress: list[tuple[str, int, bool]] = []
+    agent_cmd_count = 0
+    thought_count = 0
+    start_ts: str | None = None
+    end_ts: str | None = None
 
     for e in events:
         if e.type == "run_started":
             tid = e.data.get("task_id")
             if isinstance(tid, str):
                 task_id = tid
+            start_ts = e.ts
+        elif e.type == "agent_command":
+            agent_cmd_count += 1
+        elif e.type == "agent_thought":
+            thought_count += 1
         elif e.type == "egress_attempt":
             host = str(e.data.get("host", ""))
             port_raw = e.data.get("port", 0)
@@ -370,11 +423,114 @@ def _summarize(path: Path, events: list[TrajectoryEvent]) -> _RunSummary:
         elif e.type == "run_finished":
             outcome = str(e.data.get("result", "incomplete"))
             reason = str(e.data.get("reason", ""))
+            end_ts = e.ts
 
-    return _RunSummary(path, task_id, outcome, reason, egress)
+    duration_s: float | None = None
+    if start_ts is not None and end_ts is not None:
+        a, b = _parse_ts(start_ts), _parse_ts(end_ts)
+        if a is not None and b is not None:
+            duration_s = (b - a).total_seconds()
+
+    return _RunSummary(
+        path=path,
+        task_id=task_id,
+        outcome=outcome,
+        reason=reason,
+        egress=egress,
+        agent_cmd_count=agent_cmd_count,
+        thought_count=thought_count,
+        duration_s=duration_s,
+    )
+
+
+def _per_task_rows(runs: list[_RunSummary]) -> list[dict[str, Any]]:
+    """Build one row of stats per task_id, sorted by task_id."""
+    by_task: dict[str, list[_RunSummary]] = {}
+    for r in runs:
+        by_task.setdefault(r.task_id or "(unknown)", []).append(r)
+
+    rows: list[dict[str, Any]] = []
+    for tid in sorted(by_task):
+        rs = by_task[tid]
+        total = len(rs)
+        passed = sum(1 for r in rs if r.outcome == "passed")
+        failed = sum(1 for r in rs if r.outcome == "failed")
+        errored = sum(1 for r in rs if r.outcome == "error")
+
+        cmd_counts = [r.agent_cmd_count for r in rs]
+        med_cmds = float(statistics.median(cmd_counts)) if cmd_counts else 0.0
+
+        durations = [r.duration_s for r in rs if r.duration_s is not None]
+        med_dur = float(statistics.median(durations)) if durations else 0.0
+
+        runs_with_thought = sum(1 for r in rs if r.thought_count > 0)
+        thoughts_pct = (runs_with_thought * 100) // total if total else 0
+        pass_rate = (passed * 100) // total if total else 0
+
+        rows.append(
+            {
+                "task_id": tid,
+                "runs": total,
+                "pass": passed,
+                "fail": failed,
+                "error": errored,
+                "pass_rate": pass_rate,
+                "median_agent_cmds": round(med_cmds, 1),
+                "median_duration_s": round(med_dur, 1),
+                "thoughts_pct": thoughts_pct,
+            }
+        )
+    return rows
+
+
+def _overall_metrics(runs: list[_RunSummary]) -> dict[str, Any]:
+    total = len(runs)
+    passed = sum(1 for r in runs if r.outcome == "passed")
+    total_thoughts = sum(r.thought_count for r in runs)
+    runs_with_thought = sum(1 for r in runs if r.thought_count > 0)
+    total_egress = sum(len(r.egress) for r in runs)
+    egress_allowed = sum(1 for r in runs for (_, _, a) in r.egress if a)
+    egress_denied = total_egress - egress_allowed
+    return {
+        "total_runs": total,
+        "total_passed": passed,
+        "pass_rate": (passed * 100) // total if total else 0,
+        "total_thoughts": total_thoughts,
+        "runs_with_thoughts": runs_with_thought,
+        "thoughts_pct": (runs_with_thought * 100) // total if total else 0,
+        "total_egress": total_egress,
+        "egress_allowed": egress_allowed,
+        "egress_denied": egress_denied,
+    }
+
+
+def _top_failure_reasons(runs: list[_RunSummary], n: int = 5) -> list[dict[str, Any]]:
+    c: Counter[str] = Counter(
+        r.reason for r in runs if r.outcome != "passed" and r.reason
+    )
+    return [{"reason": reason, "count": count} for reason, count in c.most_common(n)]
+
+
+def _empty_stats_payload() -> dict[str, Any]:
+    return {
+        "total_runs": 0,
+        "total_passed": 0,
+        "pass_rate": 0,
+        "total_thoughts": 0,
+        "runs_with_thoughts": 0,
+        "thoughts_pct": 0,
+        "total_egress": 0,
+        "egress_allowed": 0,
+        "egress_denied": 0,
+        "top_failure_reasons": [],
+        "by_task": [],
+    }
 
 
 def _print_stats(runs: list[_RunSummary]) -> None:
+    rows = _per_task_rows(runs)
+    overall = _overall_metrics(runs)
+
     task_ids = {r.task_id for r in runs if r.task_id is not None}
     print(f"{len(runs)} trajectories across {len(task_ids)} tasks")
     print()
@@ -389,56 +545,60 @@ def _print_stats(runs: list[_RunSummary]) -> None:
     print()
 
     # --- per-task table ---------------------------------------------
-    by_task: dict[str, list[_RunSummary]] = {}
-    for r in runs:
-        key = r.task_id or "(unknown)"
-        by_task.setdefault(key, []).append(r)
-
-    name_w = max(len("task"), max(len(k) for k in by_task))
-    print("By task:")
-    print(
-        f"  {'task':<{name_w}}  {'runs':>4}  {'passed':>6}  {'pass-rate':>9}"
+    name_w = max(len("task"), max(len(str(r["task_id"])) for r in rows))
+    header = (
+        f"  {'task':<{name_w}}  {'runs':>4}  {'pass':>4}  {'fail':>4}  "
+        f"{'err':>3}  {'pass-rate':>9}  {'med-cmds':>8}  {'med-dur':>8}  "
+        f"{'thoughts%':>9}"
     )
-    for tid in sorted(by_task):
-        rs = by_task[tid]
-        total = len(rs)
-        passed = sum(1 for r in rs if r.outcome == "passed")
-        rate = f"{(passed * 100) // total}%" if total else "-"
-        print(f"  {tid:<{name_w}}  {total:>4}  {passed:>6}  {rate:>9}")
+    print("By task:")
+    print(header)
+    for r in rows:
+        rate = f"{r['pass_rate']}%"
+        thoughts = f"{r['thoughts_pct']}%"
+        med_dur = f"{r['median_duration_s']:.1f}s"
+        med_cmds = f"{r['median_agent_cmds']:.1f}"
+        print(
+            f"  {str(r['task_id']):<{name_w}}  {r['runs']:>4}  "
+            f"{r['pass']:>4}  {r['fail']:>4}  {r['error']:>3}  "
+            f"{rate:>9}  {med_cmds:>8}  {med_dur:>8}  {thoughts:>9}"
+        )
     print()
 
-    # --- failure reasons (only if any) ------------------------------
-    fail_reasons = Counter(r.reason for r in runs if r.outcome != "passed" and r.reason)
-    if fail_reasons:
-        print("Top failure reasons:")
-        for reason, count in fail_reasons.most_common(5):
-            print(f"  {count:>2}  {_truncate(reason, 100)}")
-        print()
-
-    # --- egress summary (only if any) -------------------------------
-    all_egress = [att for r in runs for att in r.egress]
-    if all_egress:
-        runs_with_egress = sum(1 for r in runs if r.egress)
-        print(f"Egress ({len(all_egress)} attempts across {runs_with_egress} runs):")
-        per_target: dict[tuple[str, int], list[bool]] = {}
-        for host, port, allowed in all_egress:
-            per_target.setdefault((host, port), []).append(allowed)
-        target_w = max(
-            len("host:port"),
-            max(len(f"{h}:{p}") for h, p in per_target),
+    # --- overall ----------------------------------------------------
+    print("Overall:")
+    print(
+        f"  {overall['total_runs']} trajectories, "
+        f"{overall['total_passed']} passed ({overall['pass_rate']}%)"
+    )
+    print(
+        f"  {overall['total_thoughts']} agent_thought events across "
+        f"{overall['runs_with_thoughts']} runs "
+        f"({overall['thoughts_pct']}% of runs had at least one thought)"
+    )
+    if overall["total_egress"]:
+        print(
+            f"  {overall['total_egress']} egress_attempt events "
+            f"({overall['egress_allowed']} allowed, "
+            f"{overall['egress_denied']} denied)"
         )
-        for (host, port), verdicts in sorted(per_target.items()):
-            allowed_n = sum(1 for v in verdicts if v)
-            denied_n = len(verdicts) - allowed_n
-            tag = (
-                "allowed"
-                if denied_n == 0
-                else "denied"
-                if allowed_n == 0
-                else f"mixed ({allowed_n} ok / {denied_n} denied)"
-            )
-            target = f"{host}:{port}"
-            print(f"  {target:<{target_w}}  {len(verdicts):>3}  {tag}")
+    print()
+
+    # --- top failure reasons ----------------------------------------
+    failures = _top_failure_reasons(runs)
+    if failures:
+        print("Top failure reasons:")
+        for entry in failures:
+            print(f"  {entry['count']:>2}  {_truncate(str(entry['reason']), 100)}")
+
+
+def _print_stats_json(runs: list[_RunSummary]) -> None:
+    payload = {
+        **_overall_metrics(runs),
+        "top_failure_reasons": _top_failure_reasons(runs),
+        "by_task": _per_task_rows(runs),
+    }
+    print(json.dumps(payload, indent=2))
 
 
 # --- subcommand: batch --------------------------------------------------
