@@ -1,6 +1,7 @@
-"""Tiny CLI for headless task runs, trajectory inspection, and corpus stats.
+"""Tiny CLI for headless task runs, trajectory inspection, corpus stats,
+and batch driving.
 
-Three subcommands:
+Four subcommands:
 
 - `prehnite run <task.yaml>` — runs a task headless (smoke-test driver),
   optionally with a fixed list of agent commands via `--cmd`.
@@ -8,25 +9,32 @@ Three subcommands:
   trajectory so you can scan a run without manually parsing JSONL.
 - `prehnite stats [<dir>]` — aggregates across every trajectory under a
   directory: per-task pass rate, failure reasons, egress summary.
+- `prehnite batch <tasks-dir> --agent <cmd>` — for each discovered task,
+  invokes the agent command (with `{task_id}` substituted) and reports
+  the resulting trajectory's outcome. Sequential; one container at a
+  time.
 
 Use `run` to confirm your Docker image, task YAML, and trajectory wiring
 hang together before pointing a real agent at the MCP server. Use
 `inspect` to read what an agent (or the headless run) actually did. Use
-`stats` to see the shape of a whole corpus of runs.
+`stats` to see the shape of a whole corpus of runs. Use `batch` to drive
+an entire eval suite end-to-end.
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import textwrap
+import time
 from collections import Counter
 from pathlib import Path
 from typing import get_args
 
 from prehnite.runner import run
 from prehnite.schemas import EventType, RunStatus, TrajectoryEvent
-from prehnite.tasks.loader import load_task
+from prehnite.tasks.loader import discover_tasks, load_task
 from prehnite.trajectory import read_trajectory
 
 EVENT_TYPES: list[str] = list(get_args(EventType))
@@ -105,6 +113,43 @@ def main(argv: list[str] | None = None) -> int:
         help="Filter to one task id (still shows the per-task row, just with one entry)",
     )
     stats_p.set_defaults(func=_cmd_stats)
+
+    batch_p = sub.add_parser(
+        "batch",
+        help="Drive an agent against every task under a directory",
+    )
+    batch_p.add_argument(
+        "tasks_dir",
+        type=Path,
+        help="Directory of task YAML files (scanned recursively)",
+    )
+    batch_p.add_argument(
+        "--agent",
+        required=True,
+        metavar="CMD",
+        help='Shell command template for the agent; "{task_id}" is '
+        'substituted with each task id, e.g. '
+        "'claude -p \"drive prehnite {task_id}\"'",
+    )
+    batch_p.add_argument(
+        "--per-task-timeout",
+        type=int,
+        default=300,
+        metavar="SECONDS",
+        help="Kill the agent subprocess after this many seconds (default: 300)",
+    )
+    batch_p.add_argument(
+        "--task",
+        metavar="TASK_ID",
+        help="Filter to one task id (useful for debugging a single agent run)",
+    )
+    batch_p.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project root where trajectories are written (default: cwd)",
+    )
+    batch_p.set_defaults(func=_cmd_batch)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -394,6 +439,158 @@ def _print_stats(runs: list[_RunSummary]) -> None:
             )
             target = f"{host}:{port}"
             print(f"  {target:<{target_w}}  {len(verdicts):>3}  {tag}")
+
+
+# --- subcommand: batch --------------------------------------------------
+
+
+# Outcomes the agent process layer adds on top of the trajectory's own
+# (passed | failed | error | incomplete). Kept short for table rendering.
+_AGENT_TIMEOUT = "agent_timeout"
+_NO_TRAJECTORY = "no_trajectory"
+
+
+def _cmd_batch(args: argparse.Namespace) -> int:
+    tasks_dir: Path = args.tasks_dir
+    if not tasks_dir.is_dir():
+        print(f"error: tasks dir not found: {tasks_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        tasks = discover_tasks(tasks_dir)
+    except Exception as e:
+        print(f"error: could not load tasks from {tasks_dir}: {e}", file=sys.stderr)
+        return 2
+
+    if args.task:
+        tasks = [t for t in tasks if t.id == args.task]
+    if not tasks:
+        print("no tasks to run.")
+        return 0
+
+    root: Path = args.root
+    timeout: int = args.per_task_timeout
+
+    results: list[tuple[str, str, float, Path | None]] = []
+    n = len(tasks)
+    width = max(len(t.id) for t in tasks)
+
+    for i, task in enumerate(tasks, 1):
+        agent_cmd = args.agent.replace("{task_id}", task.id)
+        print(
+            f"[{i:>{len(str(n))}}/{n}] {task.id:<{width}}  ... ",
+            end="",
+            flush=True,
+        )
+
+        started_at = time.time()
+        start_mono = time.monotonic()
+        outcome, traj = _run_one(agent_cmd, task.id, root, timeout, started_at)
+        elapsed = time.monotonic() - start_mono
+
+        traj_disp = (
+            f"  {traj.relative_to(root) if root in traj.parents else traj}"
+            if traj
+            else ""
+        )
+        print(f"{outcome:<14} ({elapsed:>4.0f}s){traj_disp}")
+        results.append((task.id, outcome, elapsed, traj))
+
+    _print_batch_summary(results)
+
+    # Exit 0 only if every task passed. Anything else is a non-success run
+    # that a CI / eval pipeline should notice.
+    return 0 if all(o == "passed" for _, o, _, _ in results) else 1
+
+
+def _run_one(
+    agent_cmd: str,
+    task_id: str,
+    root: Path,
+    timeout: int,
+    started_at: float,
+) -> tuple[str, Path | None]:
+    """Run the agent subprocess for one task; return (outcome, trajectory_path)."""
+    try:
+        subprocess.run(
+            agent_cmd,
+            shell=True,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            cwd=root,
+        )
+    except subprocess.TimeoutExpired:
+        traj = _latest_new_trajectory(task_id, root, started_at)
+        # The MCP server may have written a partial trajectory before the
+        # agent was killed; surface it if so but mark the outcome as the
+        # agent timeout, not whatever the partial run_finished says.
+        return _AGENT_TIMEOUT, traj
+    except FileNotFoundError as e:
+        # Shell wasn't found, or on Windows the entry binary doesn't exist.
+        print(f"\n  error: could not start agent: {e}", file=sys.stderr)
+        return _AGENT_TIMEOUT, None
+
+    traj = _latest_new_trajectory(task_id, root, started_at)
+    if traj is None:
+        return _NO_TRAJECTORY, None
+
+    return _outcome_from_trajectory(traj), traj
+
+
+def _latest_new_trajectory(
+    task_id: str, root: Path, since_wallclock: float
+) -> Path | None:
+    """Return the newest .jsonl under trajectories/<task_id>/ written at or
+    after `since_wallclock` (a `time.time()` value). None if no such file."""
+    task_dir = root / "trajectories" / task_id
+    if not task_dir.is_dir():
+        return None
+    new_files = [
+        f for f in task_dir.glob("*.jsonl") if f.stat().st_mtime >= since_wallclock
+    ]
+    if not new_files:
+        return None
+    return max(new_files, key=lambda f: f.stat().st_mtime)
+
+
+def _outcome_from_trajectory(path: Path) -> str:
+    """Read the trajectory's run_finished event; default 'incomplete' if missing."""
+    try:
+        events = read_trajectory(path)
+    except Exception:
+        return "incomplete"
+    if not events:
+        return "incomplete"
+    last = events[-1]
+    if last.type == "run_finished":
+        result = last.data.get("result", "incomplete")
+        return str(result)
+    return "incomplete"
+
+
+def _print_batch_summary(
+    results: list[tuple[str, str, float, Path | None]],
+) -> None:
+    if not results:
+        return
+    counts = Counter(outcome for _, outcome, _, _ in results)
+    n = len(results)
+    passed = counts.get("passed", 0)
+    print()
+    print(f"Batch summary: {n} tasks")
+    for name in (
+        "passed",
+        "failed",
+        "error",
+        "incomplete",
+        _AGENT_TIMEOUT,
+        _NO_TRAJECTORY,
+    ):
+        if counts.get(name):
+            print(f"  {name:<14} {counts[name]:>3}")
+    pct = (passed * 100) // n if n else 0
+    print(f"  pass-rate:     {pct}%")
 
 
 if __name__ == "__main__":

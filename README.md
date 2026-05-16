@@ -57,6 +57,14 @@ trajectory under a directory: per-task pass rate, outcome breakdown, top
 failure reasons, and (when any restricted-mode runs are present) per-host
 egress counts. `--task <id>` filters to one task.
 
+`prehnite batch <tasks-dir> --agent <cmd>` drives an agent against every
+task in a directory, sequentially. The `{task_id}` placeholder in the
+agent command is substituted per task — e.g.
+`--agent 'claude -p "drive prehnite task {task_id}"'`. The agent is
+responsible for connecting to the MCP server (the project's `.mcp.json`
+takes care of that for Claude Code). Per-task timeout is `--per-task-timeout`
+(default 300s). Exit 0 only if every task passed.
+
 ## MCP server
 
 Prehnite exposes a stdio MCP server. The server publishes these tools:
