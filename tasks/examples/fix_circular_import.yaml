@@ -1,0 +1,76 @@
+id: fix_circular_import
+description: |
+  /workspace/ has three Python files:
+    - user.py     — defines the User class
+    - order.py    — defines the Order class
+    - test_app.py — runs a small scenario and asserts a few invariants
+
+  Running `python3 test_app.py` currently fails with an ImportError
+  caused by a circular dependency between user.py and order.py — each
+  imports the other at module-load time. The first one Python tries to
+  load can't finish before the second one starts trying to read names
+  from it.
+
+  Make `python3 test_app.py` print "ok". There are several plausible
+  fixes: a deferred (function-local) import, a `TYPE_CHECKING` guard
+  on the annotation, refactoring into a third module, or merging the
+  two classes into one file. Pick whichever feels cleanest.
+
+  This is a good task to try `fork` on: snapshot before your risky
+  edit, and if that approach doesn't work, `revert` and try a
+  different one without manually undoing the change.
+image: prehnite-base:latest
+network:
+  mode: none
+timeout_seconds: 120
+workdir: /workspace
+tags: [bug-fix, python, multi-file, refactoring]
+difficulty: medium
+setup:
+  - rm -rf /workspace/*
+  - |
+    cat > /workspace/user.py <<'PY'
+    from order import Order
+
+    class User:
+        def __init__(self, name):
+            self.name = name
+            self.orders = []
+
+        def add_order(self, item):
+            self.orders.append(Order(self, item))
+
+        def total_spent(self):
+            return sum(o.cost for o in self.orders)
+    PY
+  - |
+    cat > /workspace/order.py <<'PY'
+    from user import User
+
+    class Order:
+        def __init__(self, user: User, item):
+            self.user = user
+            self.item = item
+            self.cost = 10.0
+
+        def describe(self):
+            return f"{self.user.name} ordered {self.item}"
+    PY
+  - |
+    cat > /workspace/test_app.py <<'PY'
+    from user import User
+
+    def main():
+        u = User("Alice")
+        u.add_order("widget")
+        u.add_order("gadget")
+        assert u.total_spent() == 20.0, f"expected 20, got {u.total_spent()}"
+        assert len(u.orders) == 2
+        assert u.orders[0].describe() == "Alice ordered widget"
+        print("ok")
+
+    if __name__ == "__main__":
+        main()
+    PY
+verify:
+  - cd /workspace && python3 test_app.py | grep -q ok

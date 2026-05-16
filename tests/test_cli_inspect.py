@@ -71,6 +71,21 @@ def _write_sample_trajectory(path: Path) -> None:
             },
         )
         w.write(
+            "session_forked",
+            {
+                "snapshot_id": "abcdef1234567890" * 2,
+                "container_id": "1234567890abcdef" * 4,
+            },
+        )
+        w.write(
+            "session_reverted",
+            {
+                "snapshot_id": "abcdef1234567890" * 2,
+                "previous_container_id": "1234567890abcdef" * 4,
+                "new_container_id": "fedcba0987654321" * 4,
+            },
+        )
+        w.write(
             "verify_command",
             {
                 "cmd": "test 1 = 1",
@@ -106,6 +121,11 @@ def test_inspect_renders_every_event_type(
     assert "I should also check" in out
     assert "ALLOWED" in out and "pypi.org:443" in out
     assert "DENIED" in out and "blocked.example:443" in out
+    # Fork/revert events: render with short snap/container ids, not raw dict.
+    assert "session_forked" in out
+    assert "snap=abcdef123456" in out  # truncated to 12 chars
+    assert "session_reverted" in out
+    assert "prev=1234567890ab -> new=fedcba098765" in out
     assert "verify_command" in out
     assert "passed: all verify checks passed" in out
 

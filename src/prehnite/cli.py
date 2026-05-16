@@ -344,6 +344,22 @@ def _format_event(e: TrajectoryEvent, *, full: bool) -> None:
         print(f"[{seq:>3}] {ts} run_finished     {result}: {reason}")
         return
 
+    if e.type == "session_forked":
+        snap = str(d.get("snapshot_id", ""))[:12]
+        cid = str(d.get("container_id", ""))[:12]
+        print(f"[{seq:>3}] {ts} session_forked   snap={snap}  container={cid}")
+        return
+
+    if e.type == "session_reverted":
+        snap = str(d.get("snapshot_id", ""))[:12]
+        prev = str(d.get("previous_container_id", ""))[:12]
+        new = str(d.get("new_container_id", ""))[:12]
+        print(
+            f"[{seq:>3}] {ts} session_reverted snap={snap}  "
+            f"prev={prev} -> new={new}"
+        )
+        return
+
     print(f"[{seq:>3}] {ts} {e.type}: {d}")
 
 
