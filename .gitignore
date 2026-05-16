@@ -25,6 +25,9 @@ uv.lock
 .DS_Store
 Thumbs.db
 
+# Claude Code per-project state (sessions, locks, worktrees)
+.claude/
+
 # Prehnite runtime output (keep the directory itself, ignore its contents)
 /trajectories/*
 !/trajectories/.gitkeep
