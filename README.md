@@ -68,7 +68,7 @@ canonical shape. A minimal task:
 id: hello
 description: Create a hello.txt file containing "hi" in /workspace.
 image: prehnite-base:latest
-network: false
+network: false                # legacy shorthand; equivalent to {mode: none}
 timeout_seconds: 60
 setup:
   - mkdir -p /workspace
@@ -77,6 +77,15 @@ verify:
   - grep -q hi /workspace/hello.txt
 ```
 
+`network` accepts three shapes:
+
+- `network: false` (or omitted) — `{mode: none}`, no networking at all.
+- `network: true` — `{mode: full}`, bridged with no proxy or logging.
+- `network: {mode: restricted, extra_allow: [...]}` — bridged through an
+  HTTP CONNECT proxy that enforces a hardcoded allowlist plus
+  `extra_allow`. Every connection attempt (allowed or denied) becomes an
+  `egress_attempt` event in the trajectory.
+
 Optional `tags: [str]` and `difficulty: str` fields enable filtering via
 `list_tasks(tag, difficulty)`.
 
@@ -84,14 +93,15 @@ Optional `tags: [str]` and `difficulty: str` fields enable filtering via
 
 One JSON object per line. Event types in v0:
 
-| `type`           | Fields                                                    |
-| ---------------- | --------------------------------------------------------- |
-| `run_started`    | `task_id`, `image`, `container_id`, `network`             |
-| `setup_command`  | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`     |
-| `agent_command`  | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`     |
-| `agent_thought`  | `thought` (free-form reasoning the agent recorded)        |
-| `verify_command` | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`     |
-| `run_finished`   | `result` (`passed`/`failed`/`error`), `reason`            |
+| `type`           | Fields                                                                |
+| ---------------- | --------------------------------------------------------------------- |
+| `run_started`    | `task_id`, `image`, `container_id`, `network` (NetworkSpec dump)      |
+| `setup_command`  | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`                 |
+| `agent_command`  | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`                 |
+| `agent_thought`  | `thought` (free-form reasoning the agent recorded)                    |
+| `egress_attempt` | `host`, `port`, `allowed`, `reason`, `duration_ms` (restricted mode)  |
+| `verify_command` | `cmd`, `exit_code`, `stdout`, `stderr`, `duration_ms`                 |
+| `run_finished`   | `result` (`passed`/`failed`/`error`), `reason`                        |
 
 All events also carry `ts` (UTC ISO-8601) and `seq` (monotonic 0-indexed int).
 

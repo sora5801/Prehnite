@@ -9,12 +9,34 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 TaskId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
 """Lowercase alphanumeric + `_`/`-`, 1–64 chars. Forms part of file paths."""
+
+NetworkMode = Literal["none", "restricted", "full"]
+
+
+class NetworkSpec(BaseModel):
+    """Per-task network policy.
+
+    `mode`:
+      - `none`: container has no network at all (`network_mode=none`).
+      - `restricted`: bridged network behind an HTTP CONNECT egress proxy
+        that enforces an allowlist; every connection attempt is logged.
+      - `full`: bridged network with no proxy and no logging.
+
+    `extra_allow` is appended to the global allowlist when `mode == "restricted"`
+    and ignored otherwise. Domain entries are suffix-matched: `pythonhosted.org`
+    matches both itself and `files.pythonhosted.org`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: NetworkMode = "none"
+    extra_allow: list[str] = Field(default_factory=list)
 
 
 def utcnow_iso() -> str:
@@ -30,13 +52,28 @@ class Task(BaseModel):
     id: TaskId
     description: str = Field(min_length=1)
     image: str = Field(default="prehnite-base:latest", min_length=1)
-    network: bool = False
+    network: NetworkSpec = Field(default_factory=NetworkSpec)
     timeout_seconds: int = Field(default=120, gt=0, le=3600)
     workdir: str = "/workspace"
     setup: list[str] = Field(default_factory=list)
     verify: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     difficulty: str | None = None
+
+    @field_validator("network", mode="before")
+    @classmethod
+    def _coerce_legacy_bool(cls, v: Any) -> Any:
+        """Accept the legacy `network: true|false` shorthand from v0 YAML.
+
+        `true` maps to `mode=full` (the previous behaviour: bridged, no
+        proxy). `false` maps to `mode=none`. Any dict / NetworkSpec passes
+        through to normal validation.
+        """
+        if v is True:
+            return {"mode": "full"}
+        if v is False:
+            return {"mode": "none"}
+        return v
 
 
 class RunStatus(str, Enum):
@@ -62,6 +99,7 @@ EventType = Literal[
     "setup_command",
     "agent_command",
     "agent_thought",
+    "egress_attempt",
     "verify_command",
     "run_finished",
 ]

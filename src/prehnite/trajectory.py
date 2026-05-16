@@ -11,6 +11,7 @@ after every write so a killed process leaves a usable partial trajectory.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Self
@@ -26,6 +27,8 @@ class TrajectoryWriter:
         self._fh: IO[str] | None = None
         self._seq = 0
         self._closed = False
+        # Egress proxy writes from a background thread; serialize seq + write.
+        self._lock = threading.Lock()
 
     def __enter__(self) -> Self:
         self.open()
@@ -49,21 +52,22 @@ class TrajectoryWriter:
         self._fh = self.path.open("a", encoding="utf-8")
 
     def write(self, event_type: EventType, data: dict[str, object]) -> TrajectoryEvent:
-        if self._closed:
-            raise RuntimeError("trajectory writer is closed")
-        if self._fh is None:
-            raise RuntimeError("trajectory writer is not open")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("trajectory writer is closed")
+            if self._fh is None:
+                raise RuntimeError("trajectory writer is not open")
 
-        event = TrajectoryEvent(
-            seq=self._seq,
-            ts=utcnow_iso(),
-            type=event_type,
-            data=data,
-        )
-        self._fh.write(event.model_dump_json() + "\n")
-        self._fh.flush()
-        self._seq += 1
-        return event
+            event = TrajectoryEvent(
+                seq=self._seq,
+                ts=utcnow_iso(),
+                type=event_type,
+                data=data,
+            )
+            self._fh.write(event.model_dump_json() + "\n")
+            self._fh.flush()
+            self._seq += 1
+            return event
 
     def close(self) -> None:
         if self._fh is not None:

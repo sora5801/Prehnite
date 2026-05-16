@@ -148,7 +148,7 @@ async def test_describe_task_returns_full_spec(fake_tasks_dir: Path) -> None:
     assert spec["tags"] == ["bug-fix", "python"]
     assert spec["difficulty"] == "easy"
     # Defaults that come from the model, not the YAML, must round-trip too.
-    assert spec["network"] is False
+    assert spec["network"] == {"mode": "none", "extra_allow": []}
     assert spec["workdir"] == "/workspace"
 
 

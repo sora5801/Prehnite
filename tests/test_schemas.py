@@ -15,7 +15,7 @@ from prehnite.schemas import (
 def test_task_minimal_defaults() -> None:
     t = Task(id="hello", description="say hi")
     assert t.image == "prehnite-base:latest"
-    assert t.network is False
+    assert t.network.mode == "none"
     assert t.timeout_seconds == 120
     assert t.workdir == "/workspace"
     assert t.setup == []
@@ -65,6 +65,56 @@ def test_agent_thought_event_round_trips() -> None:
     again = TrajectoryEvent.model_validate_json(e.model_dump_json())
     assert again.type == "agent_thought"
     assert again.data == {"thought": "the count is off by one"}
+
+
+# --- network policy ------------------------------------------------------
+
+
+def test_network_spec_default_is_none() -> None:
+    t = Task(id="t", description="x")
+    assert t.network.mode == "none"
+    assert t.network.extra_allow == []
+
+
+def test_network_legacy_true_maps_to_full() -> None:
+    t = Task.model_validate({"id": "t", "description": "x", "network": True})
+    assert t.network.mode == "full"
+
+
+def test_network_legacy_false_maps_to_none() -> None:
+    t = Task.model_validate({"id": "t", "description": "x", "network": False})
+    assert t.network.mode == "none"
+
+
+def test_network_explicit_dict_round_trips() -> None:
+    t = Task.model_validate(
+        {
+            "id": "t",
+            "description": "x",
+            "network": {"mode": "restricted", "extra_allow": ["foo.example"]},
+        }
+    )
+    assert t.network.mode == "restricted"
+    assert t.network.extra_allow == ["foo.example"]
+
+
+def test_egress_attempt_event_round_trips() -> None:
+    e = TrajectoryEvent(
+        seq=7,
+        ts="2026-05-16T00:00:00Z",
+        type="egress_attempt",
+        data={
+            "host": "pypi.org",
+            "port": 443,
+            "allowed": True,
+            "reason": "matched allowlist",
+            "duration_ms": 12,
+        },
+    )
+    again = TrajectoryEvent.model_validate_json(e.model_dump_json())
+    assert again.type == "egress_attempt"
+    assert again.data["host"] == "pypi.org"
+    assert again.data["allowed"] is True
 
 
 def test_run_result_status_enum() -> None:

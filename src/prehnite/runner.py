@@ -81,7 +81,10 @@ def run(
     writer = TrajectoryWriter(out_path)
     writer.open()
 
-    sandbox = Sandbox(task)
+    def _record_egress(data: dict[str, object]) -> None:
+        writer.write("egress_attempt", data)
+
+    sandbox = Sandbox(task, egress_callback=_record_egress)
     container_id: str | None = None
 
     try:
@@ -107,7 +110,7 @@ def run(
                 "task_id": task.id,
                 "image": task.image,
                 "container_id": container_id,
-                "network": task.network,
+                "network": task.network.model_dump(mode="json"),
             },
         )
 

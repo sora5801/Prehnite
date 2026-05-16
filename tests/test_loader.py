@@ -37,7 +37,7 @@ verify:
 """.lstrip(),
     )
     t = load_task(p)
-    assert t.network is True
+    assert t.network.mode == "full"  # legacy `network: true` -> mode=full
     assert t.image == "my-image:1"
     assert t.workdir == "/work"
     assert t.setup == ["echo setup"]

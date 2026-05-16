@@ -8,12 +8,13 @@ description: |
   so that running `/workspace/venv/bin/python /workspace/app.py` succeeds
   and the output contains the message.
 
-  This task requires network access — the task spec sets `network: true`,
-  which switches the sandbox from the default `--network none` to a
-  bridged network so pip can reach PyPI. If you see a connection error,
-  the network opt-in didn't take effect.
+  This task uses `network.mode: restricted` — the sandbox routes egress
+  through an allowlisting proxy. PyPI hosts are in the default allowlist,
+  so `pip install cowsay` works; any other outbound connection would be
+  denied and logged as an `egress_attempt` event in the trajectory.
 image: prehnite-base:latest
-network: true
+network:
+  mode: restricted
 timeout_seconds: 180
 workdir: /workspace
 tags: [network, package-management]

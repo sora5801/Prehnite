@@ -14,9 +14,10 @@ from prehnite.trajectory import read_trajectory
 class _FakeSandbox:
     """Minimal Sandbox stand-in: returns exit 1 for the literal command `false`,
     exit 0 for everything else. Mirrors the Sandbox surface the runner uses
-    (start / exec / stop / container_id)."""
+    (start / exec / stop / container_id). Accepts and ignores the
+    egress_callback the runner now passes."""
 
-    def __init__(self, task: Task) -> None:
+    def __init__(self, task: Task, egress_callback: object = None) -> None:
         self.task = task
         self.container_id = "fake-container"
 

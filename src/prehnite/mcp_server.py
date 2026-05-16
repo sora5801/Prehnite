@@ -103,7 +103,11 @@ def build_server(
         out_path = trajectory_path(task, _root())
         writer = TrajectoryWriter(out_path)
         writer.open()
-        sandbox = Sandbox(task)
+
+        def _record_egress(data: dict[str, object]) -> None:
+            writer.write("egress_attempt", data)
+
+        sandbox = Sandbox(task, egress_callback=_record_egress)
         try:
             sandbox.start()
         except SandboxError as e:
@@ -120,7 +124,7 @@ def build_server(
                 "task_id": task.id,
                 "image": task.image,
                 "container_id": sandbox.container_id,
-                "network": task.network,
+                "network": task.network.model_dump(mode="json"),
             },
         )
 
