@@ -9,6 +9,9 @@ The agent drives a task interactively:
     note(session_id, thought)      -> None                 (records reasoning)
     read_trajectory(session_id,    -> list[event]          (reflect on own run so far)
                     since_seq?)
+    fork(session_id)               -> {snapshot_id}        (snapshot for revert)
+    revert(session_id,             -> {container_id}       (roll back to snapshot)
+           snapshot_id)
     finish_task(session_id)        -> RunResult            (runs verify, tears down)
     abort_task(session_id)         -> None                 (tears down without verify)
 
@@ -309,6 +312,63 @@ def build_server(
         record, the more useful the trajectory is."""
         sess = _require(sessions, session_id)
         sess.writer.write("agent_thought", {"thought": thought})
+
+    @server.tool()
+    def fork(session_id: str) -> dict[str, Any]:
+        """Snapshot the current container state. Returns a snapshot_id you
+        can pass to revert() to roll back to this exact state.
+
+        Use this before a risky action (an `rm`, a destructive refactor,
+        an experimental approach you're not sure about). If it doesn't
+        work out, call revert(session_id, snapshot_id) and try
+        something else — no need to start the task over.
+
+        A snapshot is ~1–5s to take (docker commit on the container),
+        so pick snapshot points deliberately rather than snapshotting
+        after every command. Snapshots are cleaned up when the session
+        ends (finish_task / abort_task), so they don't outlive the run.
+        """
+        sess = _require(sessions, session_id)
+        snap_id = sess.sandbox.snapshot(
+            extra_labels={"prehnite.session_id": session_id}
+        )
+        sess.writer.write(
+            "session_forked",
+            {
+                "snapshot_id": snap_id,
+                "container_id": sess.sandbox.container_id,
+            },
+        )
+        return {"snapshot_id": snap_id}
+
+    @server.tool()
+    def revert(session_id: str, snapshot_id: str) -> dict[str, Any]:
+        """Replace the current container with a fresh one created from the
+        snapshot. Returns the new container_id. Any work done since the
+        snapshot was taken is discarded.
+
+        The session_id stays the same across reverts — exec / note /
+        read_trajectory all keep working. The trajectory records a
+        session_reverted event with both the snapshot_id and the new
+        container_id, so a future reader sees the discontinuity
+        explicitly.
+        """
+        sess = _require(sessions, session_id)
+        previous_cid = sess.sandbox.container_id
+        new_cid = sess.sandbox.revert(snapshot_id)
+        sess.writer.write(
+            "session_reverted",
+            {
+                "snapshot_id": snapshot_id,
+                "previous_container_id": previous_cid,
+                "new_container_id": new_cid,
+            },
+        )
+        # The session descriptor pins the container_id used for session
+        # persistence (devlog 0017). After revert it's stale — rewrite it
+        # so a future MCP restart attaches to the new container.
+        _persist_session(_root(), session_id, sess)
+        return {"container_id": new_cid}
 
     @server.tool()
     def read_trajectory(

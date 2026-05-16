@@ -695,6 +695,8 @@ _MCP_TOOL_NAMES: tuple[str, ...] = (
     "exec",
     "note",
     "read_trajectory",
+    "fork",
+    "revert",
     "finish_task",
     "abort_task",
 )
@@ -1224,15 +1226,22 @@ def _cmd_reap(args: argparse.Namespace) -> int:
         print(f"error: could not reach Docker daemon: {e}", file=sys.stderr)
         return 2
 
-    live_ids = _live_session_container_ids(root)
+    live_session_ids = _live_session_ids(root)
+    live_container_ids = _live_session_container_ids(root)
     candidates = _find_prehnite_containers(client)
 
-    # Anything not in the live set is an orphan. Live sessions correspond
-    # to <root>/sessions/<id>.json descriptors; those containers stay put.
-    orphans = [c for c in candidates if _short_id(c) not in live_ids and c.id not in live_ids]
+    # A container is an orphan if it's not actively used by any session
+    # descriptor in <root>/sessions/. Live containers stay put.
+    orphans = [
+        c for c in candidates
+        if _short_id(c) not in live_container_ids and c.id not in live_container_ids
+    ]
+    # Snapshot images belonging to sessions that no longer exist (or never
+    # existed). The `prehnite.session_id` label is set by the fork tool.
+    orphan_snapshots = _find_orphan_snapshot_images(client, live_session_ids)
     stale_logs = _find_stale_logs(root, older_than_hours)
 
-    _print_reap_plan(orphans, stale_logs, root, dry_run)
+    _print_reap_plan(orphans, orphan_snapshots, stale_logs, root, dry_run)
 
     if dry_run:
         return 0
@@ -1245,6 +1254,14 @@ def _cmd_reap(args: argparse.Namespace) -> int:
         except (APIError, NotFound) as e:
             print(f"  warning: could not remove {_short_id(c)}: {e}", file=sys.stderr)
 
+    reaped_snapshots = 0
+    for img in orphan_snapshots:
+        try:
+            client.images.remove(img.id, force=True)
+            reaped_snapshots += 1
+        except (APIError, NotFound) as e:
+            print(f"  warning: could not remove snapshot {img.id}: {e}", file=sys.stderr)
+
     deleted_logs = 0
     for f in stale_logs:
         try:
@@ -1254,7 +1271,10 @@ def _cmd_reap(args: argparse.Namespace) -> int:
             print(f"  warning: could not delete {f}: {e}", file=sys.stderr)
 
     print()
-    print(f"Reaped {reaped_containers} containers and {deleted_logs} batch logs.")
+    print(
+        f"Reaped {reaped_containers} containers, {reaped_snapshots} snapshots, "
+        f"and {deleted_logs} batch logs."
+    )
     return 0
 
 
@@ -1275,6 +1295,62 @@ def _live_session_container_ids(root: Path) -> set[str]:
         if cid:
             ids.add(str(cid))
     return ids
+
+
+def _live_session_ids(root: Path) -> set[str]:
+    """Read every <root>/sessions/*.json descriptor; collect the session
+    ids the MCP server considers live. Used to identify orphan snapshot
+    images (those tagged with a `prehnite.session_id` label whose owning
+    session is gone)."""
+    sdir = root / "sessions"
+    if not sdir.is_dir():
+        return set()
+    ids: set[str] = set()
+    for f in sdir.glob("*.json"):
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        sid = payload.get("session_id")
+        if sid:
+            ids.add(str(sid))
+    return ids
+
+
+def _find_orphan_snapshot_images(
+    client: Any, live_session_ids: set[str]
+) -> list[Any]:
+    """Snapshot images (labeled `prehnite.snapshot=true`) whose session
+    is no longer live. The session id comes from the
+    `prehnite.session_id` label attached at commit time."""
+    try:
+        candidates = client.images.list(
+            filters={"label": "prehnite.snapshot=true"}
+        )
+    except Exception as e:
+        print(f"warning: snapshot image listing failed: {e}", file=sys.stderr)
+        return []
+    orphans: list[Any] = []
+    for img in candidates:
+        labels = _image_labels(img)
+        sid = labels.get("prehnite.session_id")
+        # No session label = can't tell which session owns it; treat as
+        # orphan (probably a forgotten test or manual `docker commit`).
+        # Snapshots labeled with a session id whose session is gone:
+        # likewise orphan.
+        if not sid or sid not in live_session_ids:
+            orphans.append(img)
+    return orphans
+
+
+def _image_labels(image: Any) -> dict[str, str]:
+    try:
+        attrs = dict(image.attrs or {})
+    except Exception:
+        attrs = {}
+    config = attrs.get("Config", {}) or {}
+    labels = config.get("Labels") or {}
+    return {str(k): str(v) for k, v in labels.items()}
 
 
 def _find_prehnite_containers(client: Any) -> list[Any]:
@@ -1316,11 +1392,12 @@ def _short_id(container: Any) -> str:
 
 def _print_reap_plan(
     orphans: list[Any],
+    orphan_snapshots: list[Any],
     stale_logs: list[Path],
     root: Path,
     dry_run: bool,
 ) -> None:
-    if not orphans and not stale_logs:
+    if not orphans and not orphan_snapshots and not stale_logs:
         print("nothing to reap. host is clean.")
         return
 
@@ -1328,6 +1405,13 @@ def _print_reap_plan(
         print(f"Containers to reap ({len(orphans)}):")
         for c in orphans:
             print(f"  {_short_id(c)}  {_image_tag(c)}  {_status_disp(c)}  {_task_label(c)}")
+    if orphan_snapshots:
+        print(f"\nSnapshot images to reap ({len(orphan_snapshots)}):")
+        for img in orphan_snapshots:
+            tags = (img.tags or ["(untagged)"]) if hasattr(img, "tags") else ["(?)"]
+            labels = _image_labels(img)
+            sid = labels.get("prehnite.session_id", "(no session label)")
+            print(f"  {tags[0]}  session={sid}")
     if stale_logs:
         print(f"\nbatch-logs to delete ({len(stale_logs)}):")
         for f in stale_logs:

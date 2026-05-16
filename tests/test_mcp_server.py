@@ -181,6 +181,170 @@ async def test_read_trajectory_empty_trajectory_returns_empty(
     assert raw["result"] == []
 
 
+# --- fork / revert ------------------------------------------------------
+
+
+class _SnapshottingSandbox:
+    """Stub Sandbox supporting snapshot/revert. Each snapshot() bumps a
+    counter and returns a synthetic id; revert() flips container_id so
+    the test can verify the swap happened."""
+
+    def __init__(self) -> None:
+        self.container_id = "live-container-0"
+        self.snapshots: list[str] = []
+        self.snapshot_labels: list[dict[str, str] | None] = []
+        self.reverted_to: str | None = None
+        self._next_id = 0
+        self._next_container = 1
+
+    def snapshot(self, extra_labels: dict[str, str] | None = None) -> str:
+        snap_id = f"snap-{self._next_id}"
+        self._next_id += 1
+        self.snapshots.append(snap_id)
+        self.snapshot_labels.append(extra_labels)
+        return snap_id
+
+    def revert(self, snapshot_id: str) -> str:
+        if snapshot_id not in self.snapshots:
+            raise Exception(f"unknown snapshot id: {snapshot_id}")
+        self.reverted_to = snapshot_id
+        self.container_id = f"live-container-{self._next_container}"
+        self._next_container += 1
+        return self.container_id
+
+    def stop(self) -> None:
+        return None
+
+
+def _seed_snapshotting_session(
+    sessions: dict[str, _Session], tmp_path: Path
+) -> tuple[str, _Session, TrajectoryWriter, _SnapshottingSandbox]:
+    out_path = tmp_path / "traj.jsonl"
+    writer = TrajectoryWriter(out_path)
+    writer.open()
+    sandbox = _SnapshottingSandbox()
+    sess = _Session(
+        task=Task(id="t", description="x"),
+        sandbox=sandbox,  # type: ignore[arg-type]
+        writer=writer,
+        trajectory_path=out_path,
+    )
+    sid = "fork-session"
+    sessions[sid] = sess
+    return sid, sess, writer, sandbox
+
+
+async def test_fork_writes_session_forked_event_and_returns_snap_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fork() snapshots the sandbox + records a session_forked event with
+    the snapshot id and the current container id."""
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer, sandbox = _seed_snapshotting_session(sessions, tmp_path)
+
+    _, raw = await server.call_tool("fork", {"session_id": sid})
+    writer.close()
+
+    snap_id = raw["snapshot_id"]
+    assert snap_id == "snap-0"
+    assert sandbox.snapshots == ["snap-0"]
+    # The fork tool tags the snapshot image with the session_id label so
+    # `prehnite reap` can identify orphans whose session is gone.
+    assert sandbox.snapshot_labels == [{"prehnite.session_id": sid}]
+
+    events = read_trajectory(sess.trajectory_path)
+    forked = [e for e in events if e.type == "session_forked"]
+    assert len(forked) == 1
+    assert forked[0].data["snapshot_id"] == "snap-0"
+    assert forked[0].data["container_id"] == "live-container-0"
+
+
+async def test_revert_swaps_container_and_writes_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """revert() rebuilds the container from the snapshot, writes a
+    session_reverted event recording both the previous and new
+    container_ids, and refreshes the session descriptor."""
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer, sandbox = _seed_snapshotting_session(sessions, tmp_path)
+
+    # Fork first to create a snapshot to revert to.
+    await server.call_tool("fork", {"session_id": sid})
+    # Now revert.
+    _, raw = await server.call_tool(
+        "revert", {"session_id": sid, "snapshot_id": "snap-0"}
+    )
+    writer.close()
+
+    new_cid = raw["container_id"]
+    assert new_cid == "live-container-1"
+    assert sandbox.container_id == "live-container-1"
+    assert sandbox.reverted_to == "snap-0"
+
+    events = read_trajectory(sess.trajectory_path)
+    reverted = [e for e in events if e.type == "session_reverted"]
+    assert len(reverted) == 1
+    assert reverted[0].data["snapshot_id"] == "snap-0"
+    assert reverted[0].data["previous_container_id"] == "live-container-0"
+    assert reverted[0].data["new_container_id"] == "live-container-1"
+
+    # The session descriptor should now point at the NEW container id so
+    # an MCP restart attaches to the right container.
+    sfile = tmp_path / "sessions" / f"{sid}.json"
+    assert sfile.is_file()
+    payload = _json.loads(sfile.read_text(encoding="utf-8"))
+    assert payload["container_id"] == "live-container-1"
+
+
+async def test_revert_unknown_snapshot_id_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    _seed_snapshotting_session(sessions, tmp_path)
+
+    with pytest.raises(Exception):
+        await server.call_tool(
+            "revert",
+            {"session_id": "fork-session", "snapshot_id": "nonexistent"},
+        )
+
+
+async def test_fork_unknown_session_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    server = build_server()
+    with pytest.raises(Exception):
+        await server.call_tool("fork", {"session_id": "nope"})
+
+
+async def test_revert_does_not_count_as_agent_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fork and revert are control-flow operations, not commands —
+    agent_command_count must stay where it was. A session that only
+    forks/reverts (no exec) would still hit the 'no agent activity'
+    verdict on verify failure."""
+    monkeypatch.setenv("PREHNITE_ROOT", str(tmp_path))
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer, _ = _seed_snapshotting_session(sessions, tmp_path)
+    sess.agent_command_count = 2  # pretend the agent did 2 things already
+
+    await server.call_tool("fork", {"session_id": sid})
+    await server.call_tool(
+        "revert", {"session_id": sid, "snapshot_id": "snap-0"}
+    )
+
+    assert sess.agent_command_count == 2  # untouched by fork/revert
+
+
 # --- list_tasks filtering + describe_task --------------------------------
 
 

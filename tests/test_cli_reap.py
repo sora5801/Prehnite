@@ -24,8 +24,18 @@ from prehnite.cli import main
 
 
 class _FakeImage:
-    def __init__(self, tags: list[str]) -> None:
+    """Stand-in for a docker.models.images.Image. Also used as a
+    Container's `image` attribute (which only needs `.tags` access)."""
+
+    def __init__(
+        self,
+        tags: list[str],
+        image_id: str | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        self.id = image_id
         self.tags = tags
+        self.attrs = {"Config": {"Labels": labels or {}}}
 
 
 class _FakeContainer:
@@ -79,19 +89,50 @@ class _FakeContainerCollection:
         return out
 
 
+class _FakeImageCollection:
+    def __init__(self, images: list[_FakeImage]) -> None:
+        self._images = images
+        self.removed: list[str] = []
+
+    def list(self, filters: dict[str, Any] | None = None):
+        filters = filters or {}
+        out: list[_FakeImage] = []
+        for img in self._images:
+            if "label" in filters:
+                want = filters["label"]
+                key, _, val = want.partition("=")
+                got = (img.attrs.get("Config", {}).get("Labels") or {}).get(key)
+                if val and got != val:
+                    continue
+                if not val and got is None:
+                    continue
+            out.append(img)
+        return out
+
+    def remove(self, image_id: str, force: bool = False) -> None:
+        self.removed.append(image_id)
+
+
 class _FakeDockerClient:
-    def __init__(self, containers: list[_FakeContainer]) -> None:
+    def __init__(
+        self,
+        containers: list[_FakeContainer],
+        images: list[_FakeImage] | None = None,
+    ) -> None:
         self.containers = _FakeContainerCollection(containers)
+        self.images = _FakeImageCollection(images or [])
 
 
 def _patch_docker(
-    monkeypatch: pytest.MonkeyPatch, containers: list[_FakeContainer]
+    monkeypatch: pytest.MonkeyPatch,
+    containers: list[_FakeContainer],
+    images: list[_FakeImage] | None = None,
 ) -> None:
     """Replace docker.from_env() with a fake that returns the given list."""
     import docker
 
     monkeypatch.setattr(
-        docker, "from_env", lambda: _FakeDockerClient(containers)
+        docker, "from_env", lambda: _FakeDockerClient(containers, images)
     )
 
 
@@ -254,7 +295,7 @@ def test_reap_deletes_stale_batch_logs(
 
     assert not stale.exists()
     assert fresh.exists()
-    assert "Reaped 0 containers and 1 batch logs" in out
+    assert "Reaped 0 containers, 0 snapshots, and 1 batch logs" in out
     assert rc == 0
 
 
@@ -322,3 +363,70 @@ def test_reap_docker_unavailable_exits_2(
     err = capsys.readouterr().err
     assert rc == 2
     assert "could not reach Docker daemon" in err
+
+
+# --- snapshot image orphan cleanup --------------------------------------
+
+
+def test_reap_removes_orphan_snapshot_with_no_live_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot image tagged with prehnite.session_id pointing at a
+    session that no longer exists is an orphan — reap it."""
+    orphan_snap = _FakeImage(
+        tags=["prehnite-snapshot:dead123"],
+        image_id="sha256:imgdead",
+        labels={"prehnite.snapshot": "true", "prehnite.session_id": "gone-sid"},
+    )
+    _patch_docker(monkeypatch, [], images=[orphan_snap])
+    # No sessions/ dir at all means gone-sid is definitely orphan.
+
+    rc = main(["reap", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert "Snapshot images to reap" in out
+    assert "prehnite-snapshot:dead123" in out
+    assert "Reaped 0 containers, 1 snapshots, and 0 batch logs" in out
+    assert rc == 0
+
+
+def test_reap_keeps_snapshot_belonging_to_live_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot whose session is still live (descriptor exists) is kept."""
+    live_snap = _FakeImage(
+        tags=["prehnite-snapshot:livesnap"],
+        image_id="sha256:imglive",
+        labels={"prehnite.snapshot": "true", "prehnite.session_id": "live-sid"},
+    )
+    _patch_docker(monkeypatch, [], images=[live_snap])
+    _write_session_json(tmp_path, "live-sid", container_id="live-container-x")
+
+    main(["reap", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert "nothing to reap" in out
+
+
+def test_reap_treats_unlabeled_snapshot_as_orphan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot image without prehnite.session_id (manual `docker commit`
+    or pre-label-era) can't be matched to any session — treat as orphan."""
+    untagged = _FakeImage(
+        tags=["prehnite-snapshot:mystery"],
+        image_id="sha256:mystery",
+        labels={"prehnite.snapshot": "true"},  # no session_id
+    )
+    _patch_docker(monkeypatch, [], images=[untagged])
+
+    main(["reap", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert "Reaped 0 containers, 1 snapshots" in out

@@ -101,6 +101,8 @@ EventType = Literal[
     "agent_command",
     "agent_thought",
     "egress_attempt",
+    "session_forked",
+    "session_reverted",
     "verify_command",
     "run_finished",
 ]
