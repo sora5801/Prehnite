@@ -9,9 +9,11 @@ or train on.**
 
 ## Status
 
-v0 — the end-to-end spine works: an agent connects via MCP, picks a task, runs
-shell commands inside an ephemeral Docker container, and a trajectory is written
-to disk.
+The end-to-end spine works: an agent connects via MCP, drives a task in an
+ephemeral Docker container, and a trajectory is written to disk capturing
+shell commands, agent-authored reasoning notes (via the `note` tool), and
+— when the task opts into `network.mode: restricted` — every network
+egress attempt with allow/deny + timing.
 
 Not yet built: web UI, syscall-level capture, multi-container orchestration,
 non-Docker sandboxes. See [CLAUDE.md](CLAUDE.md) for the full out-of-scope list.
@@ -31,8 +33,14 @@ uv sync --extra dev
 # Build the base sandbox image (one-time, ~1 min)
 docker build -t prehnite-base:latest -f docker/base.Dockerfile docker/
 
-# Run an example task end-to-end without MCP (useful for smoke-testing)
+# Headless smoke run — no --cmd means no agent commands, so verify fails with
+# reason "no agent activity (verify ran on untouched workspace)". That's
+# expected for this invocation and exercises the failure path.
 uv run prehnite run tasks/examples/hello.yaml
+
+# Supply an agent command to make verify pass:
+uv run prehnite run tasks/examples/hello.yaml \
+    --cmd 'echo hi > /workspace/hello.txt'
 
 # Inspect the trajectory
 ls trajectories/
@@ -52,8 +60,9 @@ Prehnite exposes a stdio MCP server. The server publishes these tools:
 - `finish_task(session_id)` — runs verify, writes the final event, tears down
 - `abort_task(session_id)` — tears down without running verify
 
-Wire it into a client (Claude Desktop, Claude Code, or any MCP client) by
-pointing it at:
+A `.mcp.json` is checked in at the project root, so a Claude Code session
+opened in this directory picks the server up automatically after the trust
+prompt. Other clients can point at:
 
 ```bash
 uv run prehnite-mcp
@@ -104,6 +113,13 @@ One JSON object per line. Event types in v0:
 | `run_finished`   | `result` (`passed`/`failed`/`error`), `reason`                        |
 
 All events also carry `ts` (UTC ISO-8601) and `seq` (monotonic 0-indexed int).
+
+**Temporal note for trajectory readers:** `egress_attempt` events are written
+by the proxy thread while a command's `exec_run` is still in flight, so they
+land at slightly lower `seq` numbers than the `agent_command` whose execution
+triggered them. That ordering is temporally correct — the network call
+happens *inside* the exec — and `TrajectoryWriter` is `Lock`-guarded so the
+proxy thread and main thread can't race or produce torn lines.
 
 ## Project layout
 
