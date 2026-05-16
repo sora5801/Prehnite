@@ -65,6 +65,13 @@ responsible for connecting to the MCP server (the project's `.mcp.json`
 takes care of that for Claude Code). Per-task timeout is `--per-task-timeout`
 (default 300s). Exit 0 only if every task passed.
 
+`prehnite reap [--dry-run] [--older-than-hours N]` cleans up host state
+left behind by crashed runs — removes orphan `prehnite-*` containers
+(matched by the `prehnite=true` Docker label) plus stale `batch-logs/`
+files (default older than 24h). Containers belonging to live MCP
+sessions (those with a descriptor in `<root>/sessions/`) are
+deliberately kept.
+
 ## MCP server
 
 Prehnite exposes a stdio MCP server. The server publishes these tools:

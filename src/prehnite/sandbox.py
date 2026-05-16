@@ -116,6 +116,12 @@ class Sandbox:
                 # Don't auto-remove; we remove explicitly in stop() so the
                 # caller can inspect it on failure if they want.
                 auto_remove=False,
+                # Label so `prehnite reap` can identify our containers
+                # without relying on the image name (which a user might
+                # share with unrelated work) or the command. Also tags the
+                # task id so a human poking around with `docker ps` can
+                # see which task each container came from.
+                labels={"prehnite": "true", "prehnite.task_id": self.task.id},
                 **extra_kwargs,
             )
         except ImageNotFound as e:

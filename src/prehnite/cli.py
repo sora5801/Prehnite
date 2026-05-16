@@ -1,7 +1,7 @@
 """Tiny CLI for headless task runs, trajectory inspection, corpus stats,
-batch driving, and cross-snapshot comparison.
+batch driving, cross-snapshot comparison, and host-side cleanup.
 
-Five subcommands:
+Six subcommands:
 
 - `prehnite run <task.yaml>` — runs a task headless (smoke-test driver),
   optionally with a fixed list of agent commands via `--cmd`.
@@ -15,10 +15,12 @@ Five subcommands:
 - `prehnite compare <A> <B>` — diffs two snapshots (either trajectory
   directories or stats --json outputs) and flags per-task regressions /
   improvements / new / dropped.
+- `prehnite reap` — removes orphan containers from crashed runs and
+  old batch-logs files. Respects live MCP sessions.
 
 Use `run` for smoke tests, `inspect` to read one run, `stats` for one
-corpus, `batch` to drive an agent across a suite, and `compare` to see
-how today's runs differ from yesterday's.
+corpus, `batch` to drive an agent across a suite, `compare` to see how
+today's runs differ from yesterday's, and `reap` to keep the host tidy.
 """
 
 from __future__ import annotations
@@ -205,6 +207,32 @@ def main(argv: list[str] | None = None) -> int:
         help="Emit the diff as JSON instead of the human table",
     )
     compare_p.set_defaults(func=_cmd_compare)
+
+    reap_p = sub.add_parser(
+        "reap",
+        help="Remove orphan prehnite containers and stale batch-logs files",
+    )
+    reap_p.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project root (default: cwd). Used to find live sessions and "
+        "batch-logs.",
+    )
+    reap_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be removed without actually removing anything.",
+    )
+    reap_p.add_argument(
+        "--older-than-hours",
+        type=float,
+        default=24.0,
+        metavar="HOURS",
+        help="batch-logs older than this many hours are removed "
+        "(default: 24).",
+    )
+    reap_p.set_defaults(func=_cmd_reap)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -833,12 +861,21 @@ def _latest_new_trajectory(
     task_id: str, root: Path, since_wallclock: float
 ) -> Path | None:
     """Return the newest .jsonl under trajectories/<task_id>/ written at or
-    after `since_wallclock` (a `time.time()` value). None if no such file."""
+    after `since_wallclock` (a `time.time()` value). None if no such file.
+
+    Uses 1s of slop on the mtime comparison because Windows reports file
+    mtime with lower precision than `time.time()` — a file written 0.5ms
+    after `time.time()` can stat as having an mtime ~0.5ms *before* it.
+    The pre-existing-trajectory test (test_batch_ignores_pre_existing_
+    trajectories) uses mtime=1_000_000 (year 1970), so 1s of slop doesn't
+    breach that contract.
+    """
     task_dir = root / "trajectories" / task_id
     if not task_dir.is_dir():
         return None
+    cutoff = since_wallclock - 1.0
     new_files = [
-        f for f in task_dir.glob("*.jsonl") if f.stat().st_mtime >= since_wallclock
+        f for f in task_dir.glob("*.jsonl") if f.stat().st_mtime >= cutoff
     ]
     if not new_files:
         return None
@@ -1161,6 +1198,174 @@ def _compare_payload(
         "dropped": bucket["dropped"],
         "by_task": diffs,
     }
+
+
+# --- subcommand: reap ---------------------------------------------------
+
+
+def _cmd_reap(args: argparse.Namespace) -> int:
+    root: Path = args.root
+    dry_run: bool = args.dry_run
+    older_than_hours: float = args.older_than_hours
+
+    # Late import: docker SDK only loads on demand so other subcommands
+    # (run/inspect/stats/compare/batch) don't pay for it.
+    try:
+        import docker
+        from docker.errors import APIError, DockerException, NotFound
+    except ImportError:  # pragma: no cover — docker is a hard dep
+        print("error: docker SDK not installed", file=sys.stderr)
+        return 2
+
+    try:
+        client = docker.from_env()
+    except DockerException as e:
+        print(f"error: could not reach Docker daemon: {e}", file=sys.stderr)
+        return 2
+
+    live_ids = _live_session_container_ids(root)
+    candidates = _find_prehnite_containers(client)
+
+    # Anything not in the live set is an orphan. Live sessions correspond
+    # to <root>/sessions/<id>.json descriptors; those containers stay put.
+    orphans = [c for c in candidates if _short_id(c) not in live_ids and c.id not in live_ids]
+    stale_logs = _find_stale_logs(root, older_than_hours)
+
+    _print_reap_plan(orphans, stale_logs, root, dry_run)
+
+    if dry_run:
+        return 0
+
+    reaped_containers = 0
+    for c in orphans:
+        try:
+            c.remove(force=True)
+            reaped_containers += 1
+        except (APIError, NotFound) as e:
+            print(f"  warning: could not remove {_short_id(c)}: {e}", file=sys.stderr)
+
+    deleted_logs = 0
+    for f in stale_logs:
+        try:
+            f.unlink()
+            deleted_logs += 1
+        except OSError as e:
+            print(f"  warning: could not delete {f}: {e}", file=sys.stderr)
+
+    print()
+    print(f"Reaped {reaped_containers} containers and {deleted_logs} batch logs.")
+    return 0
+
+
+def _live_session_container_ids(root: Path) -> set[str]:
+    """Read every <root>/sessions/*.json descriptor; collect the
+    container_ids the MCP server considers live. Anything else with the
+    prehnite label is an orphan eligible for cleanup."""
+    sdir = root / "sessions"
+    if not sdir.is_dir():
+        return set()
+    ids: set[str] = set()
+    for f in sdir.glob("*.json"):
+        try:
+            payload = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        cid = payload.get("container_id")
+        if cid:
+            ids.add(str(cid))
+    return ids
+
+
+def _find_prehnite_containers(client: Any) -> list[Any]:
+    """Two queries de-duped: containers with the `prehnite=true` label
+    (everything from this version onward) plus containers whose image is
+    `prehnite-base:*` (catches pre-label-era orphans the user wants to
+    sweep up). Includes stopped/exited containers since those are the
+    main reaping target."""
+    seen: dict[str, Any] = {}
+    try:
+        for c in client.containers.list(all=True, filters={"label": "prehnite=true"}):
+            seen[str(c.id)] = c
+    except Exception as e:  # docker SDK is noisy across versions
+        print(f"warning: label filter failed: {e}", file=sys.stderr)
+
+    try:
+        for c in client.containers.list(all=True, filters={"ancestor": "prehnite-base"}):
+            seen[str(c.id)] = c
+    except Exception as e:
+        print(f"warning: ancestor filter failed: {e}", file=sys.stderr)
+
+    return list(seen.values())
+
+
+def _find_stale_logs(root: Path, older_than_hours: float) -> list[Path]:
+    log_dir = root / "batch-logs"
+    if not log_dir.is_dir():
+        return []
+    cutoff = time.time() - older_than_hours * 3600
+    return sorted(
+        f for f in log_dir.glob("*.log") if f.stat().st_mtime < cutoff
+    )
+
+
+def _short_id(container: Any) -> str:
+    cid = str(container.id) if container.id else ""
+    return cid[:12]
+
+
+def _print_reap_plan(
+    orphans: list[Any],
+    stale_logs: list[Path],
+    root: Path,
+    dry_run: bool,
+) -> None:
+    if not orphans and not stale_logs:
+        print("nothing to reap. host is clean.")
+        return
+
+    if orphans:
+        print(f"Containers to reap ({len(orphans)}):")
+        for c in orphans:
+            print(f"  {_short_id(c)}  {_image_tag(c)}  {_status_disp(c)}  {_task_label(c)}")
+    if stale_logs:
+        print(f"\nbatch-logs to delete ({len(stale_logs)}):")
+        for f in stale_logs:
+            try:
+                disp = f.relative_to(root)
+            except ValueError:
+                disp = f
+            print(f"  {disp}")
+
+    if dry_run:
+        print("\n(dry-run; nothing changed.)")
+
+
+def _image_tag(container: Any) -> str:
+    try:
+        tags = list(container.image.tags) if container.image else []
+    except Exception:
+        tags = []
+    return tags[0] if tags else "(untagged)"
+
+
+def _status_disp(container: Any) -> str:
+    state = str(container.status or "?")
+    try:
+        ec = container.attrs.get("State", {}).get("ExitCode")
+        if ec is not None and state != "running":
+            state = f"{state} ({ec})"
+    except Exception:
+        pass
+    return state
+
+
+def _task_label(container: Any) -> str:
+    try:
+        labels = dict(container.labels or {})
+    except Exception:
+        labels = {}
+    tid = labels.get("prehnite.task_id")
+    return f"task={tid}" if tid else ""
 
 
 if __name__ == "__main__":
