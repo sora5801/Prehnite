@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
@@ -119,7 +119,10 @@ class Sandbox:
             raise SandboxError(f"exec failed: {e.explanation or e}") from e
         duration_ms = int((time.monotonic() - start) * 1000)
 
-        stdout_b, stderr_b = exec_result.output or (None, None)
+        # docker SDK stubs type `output` as `int | bytes | None`, but with
+        # demux=True the runtime always returns a (stdout, stderr) byte tuple.
+        demuxed = cast("tuple[bytes | None, bytes | None] | None", exec_result.output)
+        stdout_b, stderr_b = demuxed or (None, None)
         return CommandResult(
             cmd=cmd,
             exit_code=int(exec_result.exit_code or 0),
