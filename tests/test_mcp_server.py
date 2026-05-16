@@ -345,6 +345,163 @@ async def test_revert_does_not_count_as_agent_activity(
     assert sess.agent_command_count == 2  # untouched by fork/revert
 
 
+# --- branch-aware read_trajectory ---------------------------------------
+
+
+def _write_branchy_trajectory(path: Path) -> None:
+    """Synthesize a trajectory with one fork + revert cycle.
+
+    Shape (cmd's stdout doubles as a branch label so assertions are easy):
+      seq=0  agent_command  cmd=pre               (pre-fork)
+      seq=1  session_forked snapshot_id=snap-A
+      seq=2  agent_command  cmd=branch-A          (in approach A)
+      seq=3  agent_command  cmd=branch-A-more     (in approach A)
+      seq=4  session_reverted snapshot_id=snap-A
+      seq=5  agent_command  cmd=branch-B          (post-revert, current path)
+    """
+    with TrajectoryWriter(path) as w:
+        w.write("agent_command", {
+            "cmd": "pre", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1
+        })
+        w.write("session_forked", {
+            "snapshot_id": "snap-A", "container_id": "c-0"
+        })
+        w.write("agent_command", {
+            "cmd": "branch-A", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1
+        })
+        w.write("agent_command", {
+            "cmd": "branch-A-more", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1
+        })
+        w.write("session_reverted", {
+            "snapshot_id": "snap-A",
+            "previous_container_id": "c-0",
+            "new_container_id": "c-1",
+        })
+        w.write("agent_command", {
+            "cmd": "branch-B", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1
+        })
+
+
+async def test_read_trajectory_branch_all_returns_everything(
+    tmp_path: Path,
+) -> None:
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    _write_branchy_trajectory(sess.trajectory_path)
+
+    _, raw = await server.call_tool(
+        "read_trajectory", {"session_id": sid, "branch": "all"}
+    )
+    cmds = [e["data"].get("cmd") for e in raw["result"]
+            if e["type"] == "agent_command"]
+    assert cmds == ["pre", "branch-A", "branch-A-more", "branch-B"]
+
+
+async def test_read_trajectory_branch_current_excludes_reverted(
+    tmp_path: Path,
+) -> None:
+    """branch=current drops events strictly between fork and revert,
+    keeping the fork/revert markers themselves."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    _write_branchy_trajectory(sess.trajectory_path)
+
+    _, raw = await server.call_tool(
+        "read_trajectory", {"session_id": sid, "branch": "current"}
+    )
+    events = raw["result"]
+    # branch-A and branch-A-more should be filtered out.
+    cmds = [e["data"].get("cmd") for e in events if e["type"] == "agent_command"]
+    assert cmds == ["pre", "branch-B"]
+    # session_forked and session_reverted ARE current-timeline events.
+    types = [e["type"] for e in events]
+    assert "session_forked" in types
+    assert "session_reverted" in types
+
+
+async def test_read_trajectory_branch_by_snapshot_id_returns_only_that_branch(
+    tmp_path: Path,
+) -> None:
+    """branch=<snap_id> returns exactly the events strictly between the
+    fork and the matching revert."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    _write_branchy_trajectory(sess.trajectory_path)
+
+    _, raw = await server.call_tool(
+        "read_trajectory", {"session_id": sid, "branch": "snap-A"}
+    )
+    events = raw["result"]
+    cmds = [e["data"].get("cmd") for e in events if e["type"] == "agent_command"]
+    # Only the two agent_commands inside the reverted branch.
+    assert cmds == ["branch-A", "branch-A-more"]
+
+
+async def test_read_trajectory_unknown_branch_returns_empty(
+    tmp_path: Path,
+) -> None:
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    _write_branchy_trajectory(sess.trajectory_path)
+
+    _, raw = await server.call_tool(
+        "read_trajectory",
+        {"session_id": sid, "branch": "never-existed"},
+    )
+    assert raw["result"] == []
+
+
+async def test_read_trajectory_branch_for_unreverted_fork_returns_events_after(
+    tmp_path: Path,
+) -> None:
+    """A fork that hasn't been reverted yet is the live branch from that
+    snapshot — branch=<snap_id> returns events after the fork (which
+    are also 'current' since nothing's been rolled back)."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    # Lay down a trajectory with a fork but no matching revert.
+    with TrajectoryWriter(sess.trajectory_path) as w:
+        w.write("agent_command", {"cmd": "pre", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+        w.write("session_forked", {"snapshot_id": "snap-live", "container_id": "c-0"})
+        w.write("agent_command", {"cmd": "post-fork", "exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1})
+
+    _, raw = await server.call_tool(
+        "read_trajectory", {"session_id": sid, "branch": "snap-live"}
+    )
+    cmds = [e["data"].get("cmd") for e in raw["result"] if e["type"] == "agent_command"]
+    assert cmds == ["post-fork"]
+
+
+async def test_read_trajectory_branch_current_combines_with_since_seq(
+    tmp_path: Path,
+) -> None:
+    """branch and since_seq compose — agent can poll incrementally on
+    the current branch only."""
+    sessions: dict[str, _Session] = {}
+    server = build_server(sessions=sessions)
+    sid, sess, writer = _seed_session(sessions, tmp_path)
+    writer.close()
+    _write_branchy_trajectory(sess.trajectory_path)
+
+    _, raw = await server.call_tool(
+        "read_trajectory",
+        {"session_id": sid, "since_seq": 4, "branch": "current"},
+    )
+    events = raw["result"]
+    # seq 4 is the session_reverted (current), seq 5 is branch-B (current).
+    assert [e["seq"] for e in events] == [4, 5]
+
+
 # --- list_tasks filtering + describe_task --------------------------------
 
 

@@ -40,7 +40,7 @@ from mcp.server.fastmcp import FastMCP
 
 from prehnite.runner import trajectory_path
 from prehnite.sandbox import Sandbox, SandboxError
-from prehnite.schemas import RunResult, RunStatus, Task
+from prehnite.schemas import RunResult, RunStatus, Task, TrajectoryEvent
 from prehnite.tasks.loader import discover_tasks
 from prehnite.trajectory import TrajectoryWriter
 from prehnite.trajectory import read_trajectory as _read_trajectory_file
@@ -182,6 +182,67 @@ def _count_agent_commands(trajectory_path: Path) -> int:
     except Exception:
         return 0
     return sum(1 for e in events if e.type == "agent_command")
+
+
+def _filter_branch(
+    events: "list[TrajectoryEvent]", branch: str
+) -> "list[TrajectoryEvent]":
+    """Filter trajectory events by fork/revert branch.
+
+    `branch` values:
+    - "all": return everything (no filter)
+    - "current": exclude events strictly between a session_forked and
+      its matching session_reverted — i.e., the events on a branch that
+      was rolled back. session_forked and session_reverted events
+      themselves are part of the current timeline (they record what
+      really happened).
+    - "<snapshot_id>": return events on the branch starting at that
+      fork. If the snapshot was reverted, this is the events between
+      the fork and the revert. If the fork exists but no revert
+      matches, returns everything after the fork (it's the "live"
+      branch starting at that snapshot).
+
+    Unknown snapshot_id returns []. Empty event list returns [] for any
+    branch.
+    """
+    if branch == "all" or not events:
+        return list(events)
+
+    # Map snapshot_id -> the seq of its session_forked event.
+    fork_seq: dict[str, int] = {}
+    for e in events:
+        if e.type == "session_forked":
+            snap_id = str(e.data.get("snapshot_id", ""))
+            if snap_id:
+                fork_seq[snap_id] = e.seq
+
+    # For each revert that references a known fork, record the discarded
+    # range (fork_seq, revert_seq) — events strictly inside were rolled
+    # back. If the same snap_id is reverted multiple times, the latest
+    # revert wins (the earlier discarded events remain discarded by the
+    # subsequent revert's range).
+    discarded: dict[str, tuple[int, int]] = {}
+    for e in events:
+        if e.type == "session_reverted":
+            snap_id = str(e.data.get("snapshot_id", ""))
+            if snap_id in fork_seq:
+                discarded[snap_id] = (fork_seq[snap_id], e.seq)
+
+    if branch == "current":
+        discarded_seqs: set[int] = set()
+        for f_seq, r_seq in discarded.values():
+            discarded_seqs.update(range(f_seq + 1, r_seq))
+        return [e for e in events if e.seq not in discarded_seqs]
+
+    # branch == specific snapshot_id
+    if branch in discarded:
+        f_seq, r_seq = discarded[branch]
+        return [e for e in events if f_seq < e.seq < r_seq]
+    if branch in fork_seq:
+        # Fork exists but no matching revert — return events after the fork.
+        f_seq = fork_seq[branch]
+        return [e for e in events if e.seq > f_seq]
+    return []  # unknown snapshot id
 
 
 def build_server(
@@ -372,7 +433,9 @@ def build_server(
 
     @server.tool()
     def read_trajectory(
-        session_id: str, since_seq: int = 0
+        session_id: str,
+        since_seq: int = 0,
+        branch: str = "all",
     ) -> list[dict[str, Any]]:
         """Read back your own trajectory so far — every event recorded in
         this session, including setup commands, your own exec/note calls,
@@ -384,11 +447,23 @@ def build_server(
         if you last read up to seq=10, pass since_seq=11 to get just
         what's happened since. Default 0 returns everything.
 
+        Set `branch` to filter by fork/revert history:
+        - "all" (default): every event in the trajectory.
+        - "current": exclude events strictly between a session_forked
+          and its matching session_reverted (the path that was rolled
+          back). Useful when you've done multiple reverts and want to
+          focus on the live timeline.
+        - "<snapshot_id>": only events on that snapshot's branch —
+          from its fork up to its revert (or to end if not yet
+          reverted). Useful when you want to recall "what did I try
+          on the branch I abandoned?"
+
         This is a read; it doesn't count as agent activity (the
         agent_command_count that distinguishes "no activity" from
         "verify failed" is untouched)."""
         sess = _require(sessions, session_id)
         events = _read_trajectory_file(sess.trajectory_path)
+        events = _filter_branch(events, branch)
         return [
             e.model_dump(mode="json") for e in events if e.seq >= since_seq
         ]
