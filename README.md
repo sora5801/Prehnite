@@ -44,7 +44,13 @@ uv run prehnite run tasks/examples/hello.yaml \
 
 # Inspect the trajectory
 ls trajectories/
+uv run prehnite inspect trajectories/hello/<timestamp>.jsonl
 ```
+
+`prehnite inspect` pretty-prints a trajectory file. `--type agent_thought`
+(repeatable) filters to specific event types; `--full` disables truncation
+of commands and output; `--summary-only` prints just the final-result line
+and per-type counts.
 
 ## MCP server
 
