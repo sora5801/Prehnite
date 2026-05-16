@@ -76,3 +76,19 @@ def test_network_disabled_by_default() -> None:
         # network_mode=none there is no resolver.
         result = sb.exec("getent hosts example.com")
     assert result.exit_code != 0
+
+
+def test_exec_times_out_with_exit_124() -> None:
+    """A command that exceeds the per-exec timeout must be killed and
+    reported as exit 124 (the GNU `timeout` convention), not hang."""
+    import time as _time
+
+    start = _time.monotonic()
+    with Sandbox(_task(exec_timeout_seconds=1)) as sb:
+        result = sb.exec("sleep 5")
+    elapsed = _time.monotonic() - start
+
+    assert result.exit_code == 124
+    # Container startup dominates; the exec itself should be ~1s, not 5s.
+    # Allow generous slack for daemon/Docker Desktop latency on Windows.
+    assert elapsed < 30, f"exec didn't get killed in time: {elapsed:.1f}s"

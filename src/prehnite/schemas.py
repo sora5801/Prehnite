@@ -54,6 +54,7 @@ class Task(BaseModel):
     image: str = Field(default="prehnite-base:latest", min_length=1)
     network: NetworkSpec = Field(default_factory=NetworkSpec)
     timeout_seconds: int = Field(default=120, gt=0, le=3600)
+    exec_timeout_seconds: int = Field(default=60, gt=0, le=600)
     workdir: str = "/workspace"
     setup: list[str] = Field(default_factory=list)
     verify: list[str] = Field(default_factory=list)

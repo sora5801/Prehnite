@@ -82,3 +82,36 @@ def test_exec_demands_demux_true() -> None:
     sb, fake = _make(output=(None, None))
     sb.exec("anything")
     assert fake.calls[0].get("demux") is True
+
+
+# --- per-exec timeout ----------------------------------------------------
+
+
+def test_exec_wraps_cmd_with_timeout_using_task_default() -> None:
+    """The cmd Docker actually runs is `timeout N sh -c <cmd>`; N comes from
+    the Task's exec_timeout_seconds default when no kwarg is given."""
+    sb, fake = _make(output=(None, None))
+    sb.exec("echo hello")
+    actual = fake.calls[0]["cmd"]
+    assert actual == ["timeout", "60", "sh", "-c", "echo hello"]
+
+
+def test_exec_timeout_kwarg_overrides_task_default() -> None:
+    sb, fake = _make(output=(None, None))
+    sb.exec("echo hello", timeout_seconds=3)
+    assert fake.calls[0]["cmd"] == ["timeout", "3", "sh", "-c", "echo hello"]
+
+
+def test_exec_timeout_kwarg_accepts_fractional_seconds() -> None:
+    sb, fake = _make(output=(None, None))
+    sb.exec("echo hello", timeout_seconds=0.5)
+    assert fake.calls[0]["cmd"] == ["timeout", "0.5", "sh", "-c", "echo hello"]
+
+
+def test_exec_records_cmd_as_user_wrote_it_not_the_wrapped_form() -> None:
+    """Trajectory consumers should see the agent's actual command, not the
+    proxy/runtime wrapper. exec returns a CommandResult; its cmd field is
+    what gets serialised into the trajectory."""
+    sb, _ = _make(output=(b"hi\n", None))
+    r = sb.exec("echo hello")
+    assert r.cmd == "echo hello"

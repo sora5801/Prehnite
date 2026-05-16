@@ -137,20 +137,37 @@ class Sandbox:
 
         self._container = container
 
-    def exec(self, cmd: str) -> CommandResult:
+    def exec(
+        self, cmd: str, *, timeout_seconds: float | None = None
+    ) -> CommandResult:
         """Run `cmd` via `sh -c` inside the container.
 
-        Combined output is captured as separate stdout/stderr streams. We don't
-        stream — agents in v0 issue one command at a time, so blocking until
-        completion is fine and keeps the trajectory simple.
+        Wraps the command with GNU `timeout` so a runaway command can't
+        hang the session forever — when the wall clock exceeds the budget
+        the process group is killed and `exit_code` comes back as 124
+        (the conventional "timed out" code). `timeout_seconds` defaults to
+        `task.exec_timeout_seconds`; pass an explicit value to override
+        for a single call (e.g. an internal probe with a known fast bound).
+
+        Combined output is captured as separate stdout/stderr streams. We
+        don't stream — agents in v0 issue one command at a time, so
+        blocking until completion is fine and keeps the trajectory simple.
         """
         if self._container is None:
             raise SandboxError("sandbox is not started")
 
+        effective = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.task.exec_timeout_seconds
+        )
+
         start = time.monotonic()
         try:
             exec_result = self._container.exec_run(
-                cmd=["sh", "-c", cmd],
+                # `timeout` exits 124 when the budget runs out — propagated
+                # through to the CommandResult so callers can distinguish.
+                cmd=["timeout", f"{effective:g}", "sh", "-c", cmd],
                 workdir=self.task.workdir,
                 demux=True,
                 tty=False,

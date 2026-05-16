@@ -17,9 +17,20 @@ def test_task_minimal_defaults() -> None:
     assert t.image == "prehnite-base:latest"
     assert t.network.mode == "none"
     assert t.timeout_seconds == 120
+    assert t.exec_timeout_seconds == 60
     assert t.workdir == "/workspace"
     assert t.setup == []
     assert t.verify == []
+
+
+def test_task_exec_timeout_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Task(id="hello", description="x", exec_timeout_seconds=0)
+
+
+def test_task_exec_timeout_upper_bound() -> None:
+    with pytest.raises(ValidationError):
+        Task(id="hello", description="x", exec_timeout_seconds=601)
 
 
 def test_task_id_pattern_rejects_uppercase() -> None:
