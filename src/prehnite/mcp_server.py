@@ -5,6 +5,7 @@ The agent drives a task interactively:
     list_tasks()                   -> [{id, description}, ...]
     start_task(task_id)            -> {session_id, container_id, trajectory_path}
     exec(session_id, cmd)          -> CommandResult
+    note(session_id, thought)      -> None                 (records reasoning)
     finish_task(session_id)        -> RunResult            (runs verify, tears down)
     abort_task(session_id)         -> None                 (tears down without verify)
 
@@ -47,10 +48,14 @@ def _tasks_dir() -> Path:
     return Path(env).resolve() if env else _root() / "tasks"
 
 
-def build_server() -> FastMCP:
-    """Construct a FastMCP server. Factored out for testing."""
+def build_server(
+    sessions: dict[str, _Session] | None = None,
+) -> FastMCP:
+    """Construct a FastMCP server. `sessions` is exposed so tests can inject
+    fake sessions without going through start_task (which needs Docker)."""
     server = FastMCP("prehnite")
-    sessions: dict[str, _Session] = {}
+    if sessions is None:
+        sessions = {}
 
     @server.tool()
     def list_tasks() -> list[dict[str, str]]:
@@ -124,6 +129,14 @@ def build_server() -> FastMCP:
         sess.writer.write("agent_command", result.model_dump())
         sess.agent_command_count += 1
         return result.model_dump()
+
+    @server.tool()
+    def note(session_id: str, thought: str) -> None:
+        """Record your reasoning here between commands — what you tried, why
+        you tried it, what you expect to happen. The more reasoning you
+        record, the more useful the trajectory is."""
+        sess = _require(sessions, session_id)
+        sess.writer.write("agent_thought", {"thought": thought})
 
     @server.tool()
     def finish_task(session_id: str) -> dict[str, Any]:

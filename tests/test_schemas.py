@@ -55,6 +55,18 @@ def test_trajectory_event_seq_must_be_non_negative() -> None:
         TrajectoryEvent(seq=-1, ts="2026-01-01T00:00:00Z", type="run_started")
 
 
+def test_agent_thought_event_round_trips() -> None:
+    e = TrajectoryEvent(
+        seq=4,
+        ts="2026-05-16T00:00:00Z",
+        type="agent_thought",
+        data={"thought": "the count is off by one"},
+    )
+    again = TrajectoryEvent.model_validate_json(e.model_dump_json())
+    assert again.type == "agent_thought"
+    assert again.data == {"thought": "the count is off by one"}
+
+
 def test_run_result_status_enum() -> None:
     rr = RunResult(
         task_id="hello",

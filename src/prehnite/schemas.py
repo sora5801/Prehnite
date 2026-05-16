@@ -59,6 +59,7 @@ EventType = Literal[
     "run_started",
     "setup_command",
     "agent_command",
+    "agent_thought",
     "verify_command",
     "run_finished",
 ]
