@@ -135,27 +135,51 @@ def main(argv: list[str] | None = None) -> int:
         "--agent",
         required=True,
         metavar="CMD",
-        help='Shell command template for the agent; "{task_id}" is '
-        'substituted with each task id, e.g. '
-        "'claude -p \"drive prehnite {task_id}\"'",
-    )
-    batch_p.add_argument(
-        "--per-task-timeout",
-        type=int,
-        default=300,
-        metavar="SECONDS",
-        help="Kill the agent subprocess after this many seconds (default: 300)",
-    )
-    batch_p.add_argument(
-        "--task",
-        metavar="TASK_ID",
-        help="Filter to one task id (useful for debugging a single agent run)",
+        help='Shell command template for the agent. Placeholders: '
+        '"{task_id}" is substituted per task, "{tools}" expands to the '
+        'comma-separated list of mcp__prehnite__* tool names. Example: '
+        '\'claude -p --allowed-tools {tools} --model sonnet '
+        '"Drive prehnite {task_id} end-to-end and report the result"\'',
     )
     batch_p.add_argument(
         "--root",
         type=Path,
         default=Path.cwd(),
-        help="Project root where trajectories are written (default: cwd)",
+        help="Project root for trajectory output (default: cwd). Must match "
+        "the MCP server's PREHNITE_ROOT.",
+    )
+    batch_p.add_argument(
+        "--filter-tag",
+        metavar="TAG",
+        help="Pre-filter the task set: keep only tasks whose `tags` list "
+        "contains this value.",
+    )
+    batch_p.add_argument(
+        "--filter-difficulty",
+        metavar="LEVEL",
+        help="Pre-filter the task set: keep only tasks whose `difficulty` "
+        "equals this value.",
+    )
+    batch_p.add_argument(
+        "--skip-if-passed-within",
+        type=float,
+        default=0,
+        metavar="HOURS",
+        help="For each task, look at the newest existing trajectory; if it "
+        "is passed and within this many hours, skip the run. Default 0 "
+        "(run everything).",
+    )
+    batch_p.add_argument(
+        "--per-task-timeout",
+        type=int,
+        default=600,
+        metavar="SECONDS",
+        help="Kill the agent subprocess after this many seconds (default: 600)",
+    )
+    batch_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the aggregate as JSON to stdout instead of the human table",
     )
     batch_p.set_defaults(func=_cmd_batch)
 
@@ -604,10 +628,43 @@ def _print_stats_json(runs: list[_RunSummary]) -> None:
 # --- subcommand: batch --------------------------------------------------
 
 
-# Outcomes the agent process layer adds on top of the trajectory's own
-# (passed | failed | error | incomplete). Kept short for table rendering.
-_AGENT_TIMEOUT = "agent_timeout"
-_NO_TRAJECTORY = "no_trajectory"
+# Status names the batch reports. Trajectory-derived: passed | failed | error
+# | incomplete. Subprocess-derived: timeout | no-trajectory | skipped.
+_TIMEOUT = "timeout"
+_NO_TRAJECTORY = "no-trajectory"
+_SKIPPED = "skipped"
+
+# The MCP tools the prehnite server exposes. Kept here so `{tools}` in the
+# agent template expands to the exact allowed-tools list a real agent driver
+# (claude -p, etc.) needs. Keep in sync with mcp_server.build_server().
+_MCP_TOOL_NAMES: tuple[str, ...] = (
+    "list_tasks",
+    "describe_task",
+    "start_task",
+    "exec",
+    "note",
+    "finish_task",
+    "abort_task",
+)
+
+
+class _BatchResult:
+    """One row of batch output. Carries everything both the table and the
+    JSON aggregate need."""
+
+    __slots__ = ("task_id", "status", "duration_s", "trajectory")
+
+    def __init__(
+        self,
+        task_id: str,
+        status: str,
+        duration_s: float,
+        trajectory: Path | None,
+    ) -> None:
+        self.task_id = task_id
+        self.status = status
+        self.duration_s = duration_s
+        self.trajectory = trajectory
 
 
 def _cmd_batch(args: argparse.Namespace) -> int:
@@ -617,50 +674,86 @@ def _cmd_batch(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        tasks = discover_tasks(tasks_dir)
+        tasks = list(discover_tasks(tasks_dir))
     except Exception as e:
         print(f"error: could not load tasks from {tasks_dir}: {e}", file=sys.stderr)
         return 2
 
-    if args.task:
-        tasks = [t for t in tasks if t.id == args.task]
+    if args.filter_tag:
+        tasks = [t for t in tasks if args.filter_tag in t.tags]
+    if args.filter_difficulty:
+        tasks = [t for t in tasks if t.difficulty == args.filter_difficulty]
+
     if not tasks:
-        print("no tasks to run.")
+        if args.json:
+            print(json.dumps(_empty_batch_payload(), indent=2))
+        else:
+            print("no tasks to run.")
         return 0
 
     root: Path = args.root
     timeout: int = args.per_task_timeout
+    skip_window_s = float(args.skip_if_passed_within) * 3600.0
 
-    results: list[tuple[str, str, float, Path | None]] = []
+    # `{tools}` substitution: do it once, since it's constant across tasks.
+    tools_value = ",".join(f"mcp__prehnite__{name}" for name in _MCP_TOOL_NAMES)
+    agent_tmpl = args.agent.replace("{tools}", tools_value)
+
+    results: list[_BatchResult] = []
     n = len(tasks)
-    width = max(len(t.id) for t in tasks)
+    name_w = max(len(t.id) for t in tasks)
+    batch_started_mono = time.monotonic()
 
     for i, task in enumerate(tasks, 1):
-        agent_cmd = args.agent.replace("{task_id}", task.id)
-        print(
-            f"[{i:>{len(str(n))}}/{n}] {task.id:<{width}}  ... ",
-            end="",
-            flush=True,
-        )
+        # --- skip-if-passed-within check first ----------------------
+        recent = _recent_passed_trajectory(task.id, root, skip_window_s)
+        if recent is not None:
+            r = _BatchResult(task.id, _SKIPPED, 0.0, recent)
+            results.append(r)
+            if not args.json:
+                _emit_row(i, n, name_w, r, root)
+            continue
 
+        # --- agent subprocess ---------------------------------------
+        agent_cmd = agent_tmpl.replace("{task_id}", task.id)
         started_at = time.time()
         start_mono = time.monotonic()
-        outcome, traj = _run_one(agent_cmd, task.id, root, timeout, started_at)
+        status, traj = _run_one(agent_cmd, task.id, root, timeout, started_at)
         elapsed = time.monotonic() - start_mono
 
-        traj_disp = (
-            f"  {traj.relative_to(root) if root in traj.parents else traj}"
-            if traj
-            else ""
-        )
-        print(f"{outcome:<14} ({elapsed:>4.0f}s){traj_disp}")
-        results.append((task.id, outcome, elapsed, traj))
+        r = _BatchResult(task.id, status, elapsed, traj)
+        results.append(r)
+        if not args.json:
+            _emit_row(i, n, name_w, r, root)
 
-    _print_batch_summary(results)
+    wall_clock_s = time.monotonic() - batch_started_mono
 
-    # Exit 0 only if every task passed. Anything else is a non-success run
-    # that a CI / eval pipeline should notice.
-    return 0 if all(o == "passed" for _, o, _, _ in results) else 1
+    if args.json:
+        print(json.dumps(_batch_payload(results, wall_clock_s), indent=2))
+    else:
+        _print_batch_aggregate(results, wall_clock_s)
+
+    # Exit 0 iff every task either passed or was skipped (skipped tasks are
+    # cached passes, by definition). Anything else is non-success — CI /
+    # eval pipelines should notice.
+    return 0 if all(r.status in ("passed", _SKIPPED) for r in results) else 1
+
+
+def _emit_row(
+    i: int, n: int, name_w: int, r: _BatchResult, root: Path
+) -> None:
+    """Per-task progress line. Spec format: [N/M] <task_id> <status> <dur>s <path>."""
+    traj_disp = ""
+    if r.trajectory is not None:
+        try:
+            traj_disp = str(r.trajectory.relative_to(root))
+        except ValueError:
+            traj_disp = str(r.trajectory)
+    print(
+        f"[{i:>{len(str(n))}}/{n}] {r.task_id:<{name_w}} "
+        f"{r.status:<13} {r.duration_s:>4.0f}s {traj_disp}".rstrip(),
+        flush=True,
+    )
 
 
 def _run_one(
@@ -670,32 +763,47 @@ def _run_one(
     timeout: int,
     started_at: float,
 ) -> tuple[str, Path | None]:
-    """Run the agent subprocess for one task; return (outcome, trajectory_path)."""
+    """Spawn one agent subprocess; return (status, trajectory_path).
+
+    Subprocess stderr (and stdout, merged) lands in
+    root/batch-logs/<task_id>-<UTC-stamp>.log so the agent's chatter is
+    preserved for debugging but never lands on the batch caller's terminal.
+    """
+    log_path = _open_batch_log(root, task_id, started_at)
+    log_fh: Any | None = None
     try:
-        subprocess.run(
-            agent_cmd,
-            shell=True,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            cwd=root,
-        )
-    except subprocess.TimeoutExpired:
-        traj = _latest_new_trajectory(task_id, root, started_at)
-        # The MCP server may have written a partial trajectory before the
-        # agent was killed; surface it if so but mark the outcome as the
-        # agent timeout, not whatever the partial run_finished says.
-        return _AGENT_TIMEOUT, traj
-    except FileNotFoundError as e:
-        # Shell wasn't found, or on Windows the entry binary doesn't exist.
-        print(f"\n  error: could not start agent: {e}", file=sys.stderr)
-        return _AGENT_TIMEOUT, None
+        log_fh = log_path.open("a", encoding="utf-8")
+        try:
+            subprocess.run(
+                agent_cmd,
+                shell=True,
+                timeout=timeout,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=root,
+            )
+        except subprocess.TimeoutExpired:
+            traj = _latest_new_trajectory(task_id, root, started_at)
+            return _TIMEOUT, traj
+        except FileNotFoundError as e:
+            print(f"\n  error: could not start agent: {e}", file=sys.stderr)
+            return _TIMEOUT, None
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
     traj = _latest_new_trajectory(task_id, root, started_at)
     if traj is None:
         return _NO_TRAJECTORY, None
-
     return _outcome_from_trajectory(traj), traj
+
+
+def _open_batch_log(root: Path, task_id: str, started_at: float) -> Path:
+    """Compute (and ensure the parent of) the per-task log file path."""
+    log_dir = root / "batch-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.fromtimestamp(started_at).strftime("%Y%m%dT%H%M%SZ")
+    return log_dir / f"{task_id}-{stamp}.log"
 
 
 def _latest_new_trajectory(
@@ -714,6 +822,39 @@ def _latest_new_trajectory(
     return max(new_files, key=lambda f: f.stat().st_mtime)
 
 
+def _recent_passed_trajectory(
+    task_id: str, root: Path, window_s: float
+) -> Path | None:
+    """If skip-if-passed-within is in effect (window_s > 0), look at the
+    newest trajectory for this task; if its mtime is within the window AND
+    it ended in passed, return its path so the caller can skip the run."""
+    if window_s <= 0:
+        return None
+    task_dir = root / "trajectories" / task_id
+    if not task_dir.is_dir():
+        return None
+    files = sorted(
+        task_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True
+    )
+    if not files:
+        return None
+    newest = files[0]
+    if time.time() - newest.stat().st_mtime > window_s:
+        return None
+    try:
+        events = read_trajectory(newest)
+    except Exception:
+        return None
+    if not events:
+        return None
+    last = events[-1]
+    if last.type != "run_finished":
+        return None
+    if last.data.get("result") != "passed":
+        return None
+    return newest
+
+
 def _outcome_from_trajectory(path: Path) -> str:
     """Read the trajectory's run_finished event; default 'incomplete' if missing."""
     try:
@@ -729,28 +870,62 @@ def _outcome_from_trajectory(path: Path) -> str:
     return "incomplete"
 
 
-def _print_batch_summary(
-    results: list[tuple[str, str, float, Path | None]],
+def _print_batch_aggregate(
+    results: list[_BatchResult], wall_clock_s: float
 ) -> None:
-    if not results:
-        return
-    counts = Counter(outcome for _, outcome, _, _ in results)
-    n = len(results)
-    passed = counts.get("passed", 0)
     print()
-    print(f"Batch summary: {n} tasks")
+    print(f"Batch summary: {len(results)} tasks ({wall_clock_s:.0f}s wall clock)")
+    counts = Counter(r.status for r in results)
     for name in (
         "passed",
         "failed",
         "error",
         "incomplete",
-        _AGENT_TIMEOUT,
+        _TIMEOUT,
         _NO_TRAJECTORY,
+        _SKIPPED,
     ):
         if counts.get(name):
             print(f"  {name:<14} {counts[name]:>3}")
-    pct = (passed * 100) // n if n else 0
-    print(f"  pass-rate:     {pct}%")
+    n = len(results)
+    if n:
+        passed = counts.get("passed", 0) + counts.get(_SKIPPED, 0)
+        pct = (passed * 100) // n
+        print(f"  pass-rate:     {pct}%")
+    failed_ids = [r.task_id for r in results if r.status == "failed"]
+    if failed_ids:
+        print(f"  failed:        {', '.join(failed_ids)}")
+
+
+def _batch_payload(
+    results: list[_BatchResult], wall_clock_s: float
+) -> dict[str, Any]:
+    counts = Counter(r.status for r in results)
+    return {
+        "total_tasks": len(results),
+        "by_status": dict(counts),
+        "wall_clock_s": round(wall_clock_s, 1),
+        "failed_task_ids": [r.task_id for r in results if r.status == "failed"],
+        "tasks": [
+            {
+                "task_id": r.task_id,
+                "status": r.status,
+                "duration_s": round(r.duration_s, 1),
+                "trajectory": (str(r.trajectory) if r.trajectory else None),
+            }
+            for r in results
+        ],
+    }
+
+
+def _empty_batch_payload() -> dict[str, Any]:
+    return {
+        "total_tasks": 0,
+        "by_status": {},
+        "wall_clock_s": 0.0,
+        "failed_task_ids": [],
+        "tasks": [],
+    }
 
 
 if __name__ == "__main__":

@@ -31,3 +31,6 @@ Thumbs.db
 # Prehnite runtime output (keep the directory itself, ignore its contents)
 /trajectories/*
 !/trajectories/.gitkeep
+
+# Per-task agent subprocess logs from `prehnite batch`
+/batch-logs/
