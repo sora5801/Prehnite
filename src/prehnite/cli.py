@@ -1,7 +1,7 @@
 """Tiny CLI for headless task runs, trajectory inspection, corpus stats,
-and batch driving.
+batch driving, and cross-snapshot comparison.
 
-Four subcommands:
+Five subcommands:
 
 - `prehnite run <task.yaml>` — runs a task headless (smoke-test driver),
   optionally with a fixed list of agent commands via `--cmd`.
@@ -10,15 +10,15 @@ Four subcommands:
 - `prehnite stats [<dir>]` — aggregates across every trajectory under a
   directory: per-task pass rate, failure reasons, egress summary.
 - `prehnite batch <tasks-dir> --agent <cmd>` — for each discovered task,
-  invokes the agent command (with `{task_id}` substituted) and reports
-  the resulting trajectory's outcome. Sequential; one container at a
-  time.
+  invokes the agent command (with `{task_id}` / `{tools}` substituted)
+  and reports the resulting trajectory's outcome.
+- `prehnite compare <A> <B>` — diffs two snapshots (either trajectory
+  directories or stats --json outputs) and flags per-task regressions /
+  improvements / new / dropped.
 
-Use `run` to confirm your Docker image, task YAML, and trajectory wiring
-hang together before pointing a real agent at the MCP server. Use
-`inspect` to read what an agent (or the headless run) actually did. Use
-`stats` to see the shape of a whole corpus of runs. Use `batch` to drive
-an entire eval suite end-to-end.
+Use `run` for smoke tests, `inspect` to read one run, `stats` for one
+corpus, `batch` to drive an agent across a suite, and `compare` to see
+how today's runs differ from yesterday's.
 """
 
 from __future__ import annotations
@@ -182,6 +182,29 @@ def main(argv: list[str] | None = None) -> int:
         help="Emit the aggregate as JSON to stdout instead of the human table",
     )
     batch_p.set_defaults(func=_cmd_batch)
+
+    compare_p = sub.add_parser(
+        "compare",
+        help="Diff two snapshots (trajectory dirs or stats --json files) "
+        "and surface per-task regressions / improvements",
+    )
+    compare_p.add_argument(
+        "a",
+        type=Path,
+        help="First snapshot: a trajectory directory OR a .json file "
+        "produced by `prehnite stats --json`",
+    )
+    compare_p.add_argument(
+        "b",
+        type=Path,
+        help="Second snapshot: same shape options as A",
+    )
+    compare_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the diff as JSON instead of the human table",
+    )
+    compare_p.set_defaults(func=_cmd_compare)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -925,6 +948,218 @@ def _empty_batch_payload() -> dict[str, Any]:
         "wall_clock_s": 0.0,
         "failed_task_ids": [],
         "tasks": [],
+    }
+
+
+# --- subcommand: compare ------------------------------------------------
+
+
+# Per-task diff statuses. Order matters: regressions surface first.
+_DIFF_STATUSES: tuple[str, ...] = (
+    "regression",
+    "improvement",
+    "unchanged",
+    "new",
+    "dropped",
+)
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    try:
+        a_by_task, a_overall = _load_snapshot(args.a)
+        b_by_task, b_overall = _load_snapshot(args.b)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    diffs = _diff_snapshots(a_by_task, b_by_task)
+
+    if args.json:
+        print(json.dumps(_compare_payload(diffs, a_overall, b_overall), indent=2))
+    else:
+        _print_diff(diffs, a_overall, b_overall)
+
+    # Exit 1 iff there's at least one regression — designed so CI can wrap
+    # `prehnite compare baseline.json trajectories/` and notice degradation.
+    regressed = any(d["status"] == "regression" for d in diffs)
+    return 1 if regressed else 0
+
+
+def _load_snapshot(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Load a snapshot from either a `stats --json` file or a trajectories
+    directory. Returns (by_task_dict, overall_dict) — same shape regardless
+    of input form so the diff doesn't care."""
+    if not path.exists():
+        raise FileNotFoundError(f"compare: input not found: {path}")
+
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        by_task = {
+            row["task_id"]: row for row in payload.get("by_task", [])
+        }
+        overall = {
+            "total_runs": int(payload.get("total_runs", 0)),
+            "total_passed": int(payload.get("total_passed", 0)),
+            "pass_rate": int(payload.get("pass_rate", 0)),
+        }
+        return by_task, overall
+
+    if path.is_dir():
+        # Same summarization stats uses; this is the whole point of the
+        # _per_task_rows / _overall_metrics extraction.
+        runs: list[_RunSummary] = []
+        for f in sorted(path.rglob("*.jsonl")):
+            try:
+                events = read_trajectory(f)
+            except Exception as e:
+                print(f"warning: skipping {f}: {e}", file=sys.stderr)
+                continue
+            runs.append(_summarize(f, events))
+        rows = _per_task_rows(runs) if runs else []
+        by_task = {row["task_id"]: row for row in rows}
+        if runs:
+            m = _overall_metrics(runs)
+            overall = {
+                "total_runs": m["total_runs"],
+                "total_passed": m["total_passed"],
+                "pass_rate": m["pass_rate"],
+            }
+        else:
+            overall = {"total_runs": 0, "total_passed": 0, "pass_rate": 0}
+        return by_task, overall
+
+    raise FileNotFoundError(f"compare: not a file or directory: {path}")
+
+
+def _diff_snapshots(
+    a: dict[str, dict[str, Any]], b: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Per-task diff. Categorises each task as regression / improvement /
+    unchanged / new / dropped based on pass_rate movement."""
+    all_tasks = sorted(set(a) | set(b))
+    diffs: list[dict[str, Any]] = []
+    for tid in all_tasks:
+        a_row = a.get(tid)
+        b_row = b.get(tid)
+        if a_row is None and b_row is not None:
+            diffs.append(
+                {
+                    "task_id": tid,
+                    "status": "new",
+                    "a": None,
+                    "b": b_row,
+                    "delta_pass_rate": None,
+                }
+            )
+        elif b_row is None and a_row is not None:
+            diffs.append(
+                {
+                    "task_id": tid,
+                    "status": "dropped",
+                    "a": a_row,
+                    "b": None,
+                    "delta_pass_rate": None,
+                }
+            )
+        else:
+            assert a_row is not None and b_row is not None
+            delta = int(b_row.get("pass_rate", 0)) - int(a_row.get("pass_rate", 0))
+            if delta < 0:
+                status = "regression"
+            elif delta > 0:
+                status = "improvement"
+            else:
+                status = "unchanged"
+            diffs.append(
+                {
+                    "task_id": tid,
+                    "status": status,
+                    "a": a_row,
+                    "b": b_row,
+                    "delta_pass_rate": delta,
+                }
+            )
+    return diffs
+
+
+def _print_diff(
+    diffs: list[dict[str, Any]],
+    a_overall: dict[str, Any],
+    b_overall: dict[str, Any],
+) -> None:
+    if not diffs:
+        print("no tasks in either snapshot.")
+        return
+
+    # Sort: regressions first (most actionable), then improvements,
+    # unchanged, new, dropped.
+    order = {s: i for i, s in enumerate(_DIFF_STATUSES)}
+    diffs_sorted = sorted(
+        diffs, key=lambda d: (order[str(d["status"])], str(d["task_id"]))
+    )
+
+    name_w = max(len("task"), max(len(str(d["task_id"])) for d in diffs_sorted))
+    header = (
+        f"  {'task':<{name_w}}  {'A':>11}  {'B':>11}  {'delta':>7}  status"
+    )
+    print(header)
+    for d in diffs_sorted:
+        a_disp = _fmt_rate_with_runs(d["a"])
+        b_disp = _fmt_rate_with_runs(d["b"])
+        if d["delta_pass_rate"] is None:
+            delta_disp = "-"
+        else:
+            delta_disp = f"{d['delta_pass_rate']:+d}%"
+        print(
+            f"  {str(d['task_id']):<{name_w}}  {a_disp:>11}  {b_disp:>11}  "
+            f"{delta_disp:>7}  {d['status']}"
+        )
+
+    print()
+    a_rate = a_overall.get("pass_rate", 0)
+    b_rate = b_overall.get("pass_rate", 0)
+    a_runs = a_overall.get("total_runs", 0)
+    b_runs = b_overall.get("total_runs", 0)
+    a_passed = a_overall.get("total_passed", 0)
+    b_passed = b_overall.get("total_passed", 0)
+    print("Overall:")
+    print(f"  A: {a_passed}/{a_runs} ({a_rate}%)")
+    print(f"  B: {b_passed}/{b_runs} ({b_rate}%)")
+    print(f"  delta: {b_rate - a_rate:+d}%")
+
+    print()
+    counts = Counter(str(d["status"]) for d in diffs)
+    parts = [f"{counts.get(s, 0)} {s}" for s in _DIFF_STATUSES if counts.get(s)]
+    print(f"Tasks: {', '.join(parts)}" if parts else "Tasks: (no differences)")
+
+
+def _fmt_rate_with_runs(row: dict[str, Any] | None) -> str:
+    if row is None:
+        return "N/A"
+    return f"{int(row.get('pass_rate', 0))}% ({int(row.get('runs', 0))})"
+
+
+def _compare_payload(
+    diffs: list[dict[str, Any]],
+    a_overall: dict[str, Any],
+    b_overall: dict[str, Any],
+) -> dict[str, Any]:
+    bucket: dict[str, list[str]] = {s: [] for s in _DIFF_STATUSES}
+    for d in diffs:
+        bucket[str(d["status"])].append(str(d["task_id"]))
+
+    a_rate = int(a_overall.get("pass_rate", 0))
+    b_rate = int(b_overall.get("pass_rate", 0))
+    return {
+        "a": a_overall,
+        "b": b_overall,
+        "overall_delta_pass_rate": b_rate - a_rate,
+        "regressions": bucket["regression"],
+        "improvements": bucket["improvement"],
+        "unchanged": bucket["unchanged"],
+        "new": bucket["new"],
+        "dropped": bucket["dropped"],
+        "by_task": diffs,
     }
 
 
