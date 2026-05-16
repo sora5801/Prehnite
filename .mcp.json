@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "prehnite": {
+      "type": "stdio",
+      "command": "C:\\Users\\sora5\\Prehnite\\.claude\\worktrees\\magical-golick-143627\\.venv\\Scripts\\prehnite-mcp.exe",
+      "args": [],
+      "env": {
+        "PREHNITE_ROOT": "C:\\Users\\sora5\\Prehnite\\.claude\\worktrees\\magical-golick-143627"
+      }
+    }
+  }
+}

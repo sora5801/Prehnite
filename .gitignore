@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# uv
+uv.lock
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code per-project state (sessions, locks, worktrees)
+.claude/
+
+# Prehnite runtime output (keep the directory itself, ignore its contents)
+/trajectories/*
+!/trajectories/.gitkeep

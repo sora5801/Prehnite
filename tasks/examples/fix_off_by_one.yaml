@@ -1,0 +1,21 @@
+id: fix_off_by_one
+description: |
+  A Python script `count.py` is supposed to print the number of lines in
+  `data.txt`. It is currently off by one (it forgets to count the last line
+  when there is no trailing newline). Fix the bug so `python3 count.py` prints
+  the correct count.
+image: prehnite-base:latest
+network: false
+timeout_seconds: 120
+workdir: /workspace
+setup:
+  - rm -rf /workspace/*
+  - |
+    cat > /workspace/count.py <<'PY'
+    with open("data.txt") as f:
+        text = f.read()
+    print(text.count("\n"))
+    PY
+  - printf 'a\nb\nc' > /workspace/data.txt
+verify:
+  - test "$(python3 /workspace/count.py)" = "3"

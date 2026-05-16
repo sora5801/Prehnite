@@ -1,0 +1,13 @@
+id: hello
+description: |
+  Smoke test. Create a file at /workspace/hello.txt whose contents are
+  exactly the line `hi`.
+image: prehnite-base:latest
+network: false
+timeout_seconds: 30
+workdir: /workspace
+setup:
+  - rm -f /workspace/hello.txt
+verify:
+  - test -f /workspace/hello.txt
+  - test "$(cat /workspace/hello.txt)" = "hi"

@@ -1,0 +1,49 @@
+[project]
+name = "prehnite"
+version = "0.0.1"
+description = "Sandboxed Linux environment with task runner and trajectory logger for evaluating coding agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "sora5801" }]
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "docker>=7.1",
+    "mcp>=1.2",
+]
+
+[project.scripts]
+prehnite = "prehnite.cli:main"
+prehnite-mcp = "prehnite.mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prehnite"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/prehnite"]
+
+[[tool.mypy.overrides]]
+module = ["docker.*", "mcp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: tests that require Docker to be running",
+]
