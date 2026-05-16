@@ -52,6 +52,11 @@ uv run prehnite inspect trajectories/hello/<timestamp>.jsonl
 of commands and output; `--summary-only` prints just the final-result line
 and per-type counts.
 
+`prehnite stats [<dir>]` (default `trajectories/`) aggregates across every
+trajectory under a directory: per-task pass rate, outcome breakdown, top
+failure reasons, and (when any restricted-mode runs are present) per-host
+egress counts. `--task <id>` filters to one task.
+
 ## MCP server
 
 Prehnite exposes a stdio MCP server. The server publishes these tools:
